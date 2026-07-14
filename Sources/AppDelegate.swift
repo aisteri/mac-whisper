@@ -30,8 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var voiceSourceFull = ""
     private var voiceTargetFull = ""
     /// What the gate has actually sent to the voice — the caption source in
-    /// streaming mode, so screen and speech always agree.
+    /// gate-driven modes, so screen and speech always agree.
     private var voiceSpokenCaption = ""
+    /// True while the speech gate owns the captions (DeepL Voice and Apple
+    /// interpreter sessions); the LLM path keeps grey/white agreement runs.
+    private var gateDrivesCaptions = false
     private var voiceRestarts = 0
 
     /// What a locked session is for: a meeting capture (transcript + optional
@@ -318,10 +321,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.autosaveLockedTranscript(text)
         }
         translator.onDisplay = { [weak self] transcript, caption in
-            self?.transcriptWindow.updateTranscript(transcript)
+            guard let self else { return }
+            self.transcriptWindow.updateTranscript(transcript)
             // Committed words render white, the still-moving hypothesis (or an
-            // untranslated line's source fallback) dimmed.
-            self?.subtitles.update(pieces: caption.map { ($0.text, $0.committed) })
+            // untranslated line's source fallback) dimmed. In gate mode the
+            // captions follow the SPOKEN stream instead (appendVoiceCaption)
+            // — no flickering grey, screen matches the voice.
+            if !self.gateDrivesCaptions {
+                self.subtitles.update(pieces: caption.map { ($0.text, $0.committed) })
+            }
         }
         translator.onSpeakableTranslation = { [weak self] text in
             self?.speechOutput.enqueue(text)
@@ -502,9 +510,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         longForm.bypassAnalyzer = false
         longForm.externalAudioSink = nil
         voiceSession = nil
+        gateDrivesCaptions = false
         lockMode = mode
         if mode == .interpreter {
             translator.reset()
+            translator.onSpeechStreams = nil
             speechOutput.reset()
             speechOutput.enabled = settings.speakTranslations
             speechOutput.duckOthers = settings.duckWhileSpeaking
@@ -521,6 +531,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if settings.speakTranslations && settings.duckWhileSpeaking {
                 SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
             }
+            speechGate.reset()
+            speechGate.earlySpeech = settings.earlySpeechEnabled
+            voiceSpokenCaption = ""
+            // The gate drives speech AND captions for the stream-shaped
+            // providers (DeepL Voice, Apple); the LLM path keeps the legacy
+            // per-utterance hand-off and grey/white captions.
+            gateDrivesCaptions = settings.appleTranslationEnabled || settings.deeplVoiceEnabled
             translator.appleTranslator = nil
             if settings.appleTranslationEnabled {
                 // On-device path: by construction NO network request is made
@@ -529,6 +546,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 translator.targetLanguage = settings.interpreterTargetLanguage
                 translator.sourceLanguage = settings.interpreterSourceLanguage
                 translator.appleTranslator = appleTranslator
+                // Same gate as DeepL Voice: clause-level early speech from
+                // the live line, ledger dedup, playback-synced captions.
+                translator.onSpeechStreams = { [weak self] concluded, tentative in
+                    self?.speechGate.update(concludedStream: concluded, tentative: tentative)
+                }
                 let source = AppleTranslator.localeLanguage(forPrompt: settings.interpreterSourceLanguage)
                 let target = AppleTranslator.localeLanguage(forPrompt: settings.interpreterTargetLanguage)
                     ?? Locale.Language(identifier: "en")
@@ -543,10 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // problems apply.
                 voiceSourceBase = ""; voiceTargetBase = ""
                 voiceSourceFull = ""; voiceTargetFull = ""
-                voiceSpokenCaption = ""
                 voiceRestarts = 0
-                speechGate.reset()
-                speechGate.earlySpeech = settings.earlySpeechEnabled
                 longForm.bypassAnalyzer = true
                 startVoiceSession()
             } else if settings.deeplEnabled && settings.deeplConfigured {
@@ -858,7 +877,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Appends spoken (or gate-settled, when TTS is off) text to the
     /// streaming-mode caption and redraws it.
     private func appendVoiceCaption(_ text: String) {
-        guard longForm.bypassAnalyzer else { return }
+        guard gateDrivesCaptions else { return }
         voiceSpokenCaption += voiceSpokenCaption.isEmpty ? text : " " + text
         if voiceSpokenCaption.count > 2000 {
             voiceSpokenCaption = String(voiceSpokenCaption.suffix(1000))
