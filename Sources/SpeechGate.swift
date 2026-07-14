@@ -32,6 +32,10 @@ final class SpeechGate {
     var speak: ((String) -> Void)?
     /// When false, only concluded sentences pass (no early speech).
     var earlySpeech = true
+    /// The unstable region's text that has NOT been handed to the voice —
+    /// the caption's grey tail. The gate owns the spoken/unspoken boundary,
+    /// so the caption reading this can never show duplicated content.
+    private(set) var pendingText = ""
 
     /// Chars of the concluded stream already moved into `assembling`.
     private var spokenConcluded = 0
@@ -103,6 +107,7 @@ final class SpeechGate {
         earlyMarks = []
         spokenTail = ""
         spokenPieces = []
+        pendingText = ""
         clearCandidate()
     }
 
@@ -129,8 +134,7 @@ final class SpeechGate {
             spokenConcluded = concludedStream.count
             settleAssembled()
         }
-        guard earlySpeech else { return }
-        considerUnstable(tentative)
+        considerUnstable(tentative) // also maintains pendingText
     }
 
     // MARK: - Concluded settlement
@@ -250,21 +254,23 @@ final class SpeechGate {
     /// has stayed unchanged long enough.
     private func considerUnstable(_ tentative: String) {
         var (pieces, tail) = Self.splitSentences(assembling + tentative)
-        if tail.trimmingCharacters(in: .whitespaces).isEmpty {
-            if !pieces.isEmpty { pieces.removeLast() } // no next sentence started: not trusted yet
+        var untrusted = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if untrusted.isEmpty {
+            // No next sentence started: the final sentence isn't trusted yet.
+            if !pieces.isEmpty { untrusted = pieces.removeLast() }
         } else {
             // Salami technique: a long sentence still being formed need not
             // be waited out whole — its clauses up to the last comma with
             // text already flowing AFTER it are as pinned down as a
-            // followed sentence, so they speak now. Awkward clause-by-
-            // clause delivery traded for keeping pace (user's call); the
-            // ledger reconciles the conclusion by size, so no dedup worry.
+            // followed sentence, so they speak now. Clause by clause, NOT
+            // as one block: all-or-nothing coverage re-spoke an already-
+            // voiced leading clause whenever a rewrite grew the block.
             let clause = Self.clauseBoundedPrefix(of: tail)
-            // Clause by clause, NOT as one block: all-or-nothing coverage
-            // re-spoke an already-voiced leading clause whenever a rewrite
-            // grew the block past the balance (observed twice in one
-            // session — "그러면 앞서…" spoken again inside its extension).
-            if !clause.isEmpty { pieces.append(contentsOf: Self.splitClauses(clause)) }
+            if !clause.isEmpty {
+                pieces.append(contentsOf: Self.splitClauses(clause))
+                untrusted = String(tail.dropFirst(clause.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         var covered = 0
         var unspoken: [String] = []
@@ -278,6 +284,14 @@ final class SpeechGate {
             } else {
                 unspoken.append(piece)
             }
+        }
+        // Everything not yet handed to the voice — the caption's grey tail.
+        pendingText = (unspoken + [untrusted])
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard earlySpeech else {
+            clearCandidate()
+            return
         }
         let newCandidate = unspoken.joined(separator: " ")
         let newNorm = Self.normalize(newCandidate)
@@ -336,6 +350,12 @@ final class SpeechGate {
         SpeechService.diag("gate speak(early) stable=\(stableMs)ms bal=\(earlyBalance) \"\(candidate.prefix(60))\"")
         let text = candidate
         clearCandidate()
+        // The grey tail loses what just moved into the voice, immediately —
+        // waiting for the next transcript update would show it doubled.
+        if pendingText.hasPrefix(text) {
+            pendingText = String(pendingText.dropFirst(text.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         speak?(text)
     }
 

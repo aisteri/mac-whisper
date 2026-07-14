@@ -58,10 +58,11 @@ final class SubtitleOverlay {
     private var lastHighlight = 0
     private var lastContentAt = Date.distantPast
     private var idleTimer: Timer?
-    /// 12 s, not shorter: interpreter captions update only when the voice
-    /// speaks, and translated sentences legitimately arrive ten-plus
-    /// seconds apart — a 4 s fade kept vanishing captions mid-meeting.
-    private let idleFadeAfter: TimeInterval = 12.0
+    /// 30 s, generous on purpose: readers reported captions "suddenly
+    /// turning off" mid-meeting. The panel should only ever clear during a
+    /// genuine lull, and never while anything is being spoken or
+    /// transcribed (see isBusy).
+    private let idleFadeAfter: TimeInterval = 30.0
 
     init() {
         let rect = NSRect(x: 0, y: 0, width: 400, height: 44)
@@ -311,75 +312,61 @@ final class SubtitleOverlay {
     private var karaokeCache: (text: String, width: CGFloat, starts: [Int])?
     private var karaokeFrameSet = false
 
-    /// Renders the spoken stream's last two wrapped lines (white; the
-    /// currently-heard utterance highlighted up to the play head) plus one
-    /// dimmed preview line of the newest unstable translation.
-    func updateKaraoke(spoken: String, speaking: String, speakingUpTo: Int, preview: String) {
+    /// ONE continuous text, three colors, two boundaries that only move
+    /// rightward: yellow (played through the speakers) → white (settled,
+    /// awaiting the voice) → grey (still being transcribed/translated).
+    /// The same words never appear twice, nothing is layered — a sentence
+    /// is born grey, hardens white in place, and turns yellow as it is
+    /// heard. Shows the last wrapped lines of that stream, left-aligned in
+    /// a fixed box.
+    ///
+    /// `playedChars` is a Character offset into `settled`; `grey` is the
+    /// gate's pending (unspoken) tail, so duplication is impossible by
+    /// construction.
+    func updateKaraoke(settled: String, playedChars: Int, grey: String) {
         guard armed else { return }
-        let stream = [spoken, speaking].filter { !$0.isEmpty }.joined(separator: " ")
-        guard stream.contains(where: { $0.isLetter || $0.isNumber })
-                || preview.contains(where: { $0.isLetter || $0.isNumber }) else { return }
+        let full = [settled, grey].filter { !$0.isEmpty }.joined(separator: " ")
+        guard full.contains(where: { $0.isLetter || $0.isNumber }) else { return }
 
         let textWidth = karaokeTextWidth()
-        let ns = stream as NSString
-        let starts = karaokeLineStarts(stream, width: textWidth)
-        let visibleStart = starts.count >= 2 ? starts[starts.count - 2] : 0
+        let ns = full as NSString
+        let starts = karaokeLineStarts(full, width: textWidth)
+        let visibleStart = starts.count >= 3 ? starts[starts.count - 3] : 0
 
-        // Highlight range in UTF-16, global to the stream.
-        let speakLenU = (speaking as NSString).length
-        let speakStartU = ns.length - speakLenU
-        var upToU = speakStartU
-        if !speaking.isEmpty {
-            let cut = min(speakingUpTo, speaking.count)
-            let idx = speaking.index(speaking.startIndex, offsetBy: cut)
-            upToU = speakStartU + speaking.utf16.distance(from: speaking.utf16.startIndex,
-                                                          to: idx.samePosition(in: speaking.utf16)!)
+        // Boundaries in UTF-16, global to the full text.
+        let settledEndU = (settled as NSString).length
+        var playedU = 0
+        if !settled.isEmpty {
+            let cut = min(playedChars, settled.count)
+            let idx = settled.index(settled.startIndex, offsetBy: cut)
+            playedU = settled.utf16.distance(from: settled.utf16.startIndex,
+                                             to: idx.samePosition(in: settled.utf16)!)
         }
 
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .left
         paragraph.lineBreakMode = .byWordWrapping
         let base: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: paragraph]
-        func run(_ range: NSRange, _ color: NSColor) -> NSAttributedString {
-            NSAttributedString(string: ns.substring(with: range),
-                               attributes: base.merging([.foregroundColor: color]) { a, _ in a })
-        }
         let styled = NSMutableAttributedString()
-        let spokenEnd = max(visibleStart, min(speakStartU, ns.length))
-        if spokenEnd > visibleStart {
-            styled.append(run(NSRange(location: visibleStart, length: spokenEnd - visibleStart), .white))
+        func run(_ from: Int, _ to: Int, _ color: NSColor) {
+            guard to > from else { return }
+            styled.append(NSAttributedString(
+                string: ns.substring(with: NSRange(location: from, length: to - from)),
+                attributes: base.merging([.foregroundColor: color]) { a, _ in a }))
         }
-        if speakLenU > 0 {
-            let hlStart = max(visibleStart, speakStartU)
-            if upToU > hlStart {
-                styled.append(run(NSRange(location: hlStart, length: upToU - hlStart), .systemYellow))
-            }
-            if ns.length > max(hlStart, upToU) {
-                let from = max(hlStart, upToU)
-                styled.append(run(NSRange(location: from, length: ns.length - from),
-                                  NSColor.white.withAlphaComponent(0.75)))
-            }
-        }
-        // Preview: one line only, its newest tail, dimmed. Rewrites are
-        // confined to this bottom slot by design.
-        if !preview.isEmpty {
-            let pStarts = karaokeLineStarts(preview, width: textWidth, cache: false)
-            let pNS = preview as NSString
-            let lastLine = pNS.substring(from: pStarts.last ?? 0)
-            styled.append(NSAttributedString(string: (styled.length > 0 ? "\n" : "") + lastLine,
-                                             attributes: base.merging(
-                                                [.foregroundColor: NSColor.white.withAlphaComponent(0.5)]) { a, _ in a }))
-        }
+        run(visibleStart, min(playedU, ns.length), .systemYellow)
+        run(max(visibleStart, playedU), min(settledEndU, ns.length), .white)
+        run(max(visibleStart, settledEndU), ns.length, NSColor.white.withAlphaComponent(0.55))
 
         let key = styled.string
         if key == lastContent {
-            guard Int(upToU) != lastHighlight else { return }
-            lastHighlight = Int(upToU)
+            guard playedU != lastHighlight else { return }
+            lastHighlight = playedU
             textField.attributedStringValue = styled
             return
         }
         lastContent = key
-        lastHighlight = Int(upToU)
+        lastHighlight = playedU
         lastContentAt = Date()
         flashGen &+= 1
         textField.attributedStringValue = styled
