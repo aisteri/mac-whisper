@@ -103,6 +103,12 @@ enum SystemAudio {
     /// exact even if the default output changes while speaking.
     private static var duckedDevice: AudioDeviceID?
     private static var preDuckVolume: Float?
+    /// The user's REAL volume, remembered across duck cycles. Sampling the
+    /// current volume on every duck poisoned it: sample during the previous
+    /// unduck's 200 ms ramp (or after a session died ducked) and the
+    /// half-lowered value becomes the new "original" — measured shrinking
+    /// 0.236 → 0.118 → 0.059 across sessions, never recovering.
+    private static var userVolume: (device: AudioDeviceID, volume: Float)?
 
     /// Lower the default output volume to `factor` × its current value, so a
     /// spoken translation (played at boosted gain through the app's own audio
@@ -118,13 +124,25 @@ enum SystemAudio {
     static func duckOutput(to factor: Float) -> Bool {
         if duckedDevice != nil { return true } // already ducked
         guard let device = defaultOutputDeviceID(),
-              let volume = outputVolume(device) else {
+              let sampled = outputVolume(device) else {
             diag("duck unavailable: output device has no volume control (HDMI/DP monitor?)")
             return false
         }
+        // Trust the remembered user volume over a suspiciously low sample:
+        // the previous unduck's ramp may still be mid-flight, or the last
+        // session died while ducked. A sample at or above ~90% of the
+        // remembered value means the user genuinely changed the volume —
+        // adopt it.
+        var volume = sampled
+        if let remembered = userVolume, remembered.device == device,
+           sampled < remembered.volume * 0.9 {
+            volume = remembered.volume
+            diag("duck: sampled \(sampled) looks ducked — using remembered \(volume)")
+        }
+        userVolume = (device, volume)
         duckedDevice = device
         preDuckVolume = volume
-        rampOutputVolume(device, from: volume, to: volume * factor)
+        rampOutputVolume(device, from: sampled, to: volume * factor)
         diag("ducked output \(volume) -> \(volume * factor)")
         return true
     }
