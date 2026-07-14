@@ -589,13 +589,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // from the menu) and the menu-bar icon carry the feedback.
         transcriptWindow.updateTranscript("")
         let interpLabel: String
+        // The ACTIVE provider's target — the DeepL paths translate into
+        // deeplTargetLang; interpreterTargetLanguage belongs to the LLM and
+        // Apple paths and may hold a stale value from a provider switch.
+        let usesDeepL = longForm.bypassAnalyzer || translator.useDeepL
+        let targetName = usesDeepL
+            ? (DeepLTranslator.targetLanguages.first { $0.code == settings.deeplTargetLang }?.display
+               ?? settings.deeplTargetLang)
+            : settings.interpreterTargetLanguage
         if mode == .interpreter {
             let via = longForm.bypassAnalyzer ? "DeepL Voice"
                 : translator.appleTranslator != nil ? "Apple (on-device)"
                 : translator.useDeepL ? "DeepL" : "LLM"
-            let target = (longForm.bypassAnalyzer || translator.useDeepL)
-                ? settings.deeplTargetLang : settings.interpreterTargetLanguage
-            interpLabel = "● Interpreting → \(target) via \(via)…"
+            interpLabel = "● Interpreting → \(targetName) via \(via)…"
         } else {
             interpLabel = "● Recording…  (⌃⇧Fn to stop)"
         }
@@ -608,7 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // register and press again, which stops the recording they just began.
         NSSound(named: "Pop")?.play()
         subtitles.flashStatus(mode == .interpreter
-            ? "● 통역 시작 → \(settings.interpreterTargetLanguage)"
+            ? "● 통역 시작 → \(targetName)"
             : "● 녹음 시작")
         longForm.start(language: settings.language)
         rebuildMenu()
