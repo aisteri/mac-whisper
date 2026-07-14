@@ -43,7 +43,9 @@ final class SpeechOutput {
     /// without hard clipping. That also makes the voice louder on outputs
     /// whose system volume cannot be ducked at all (HDMI/DP monitors expose
     /// no volume control) — there the boost is the only lever we have.
-    private let duckFactor: Float = 0.35
+    /// 0.5, not lower: with the original inaudible the listener can't even
+    /// tell someone is speaking — the duck should shape, not erase.
+    private let duckFactor: Float = 0.5
     private let voiceBoost: Float = 2.4
 
     /// Base speech rate: 10% above the system default (user-tuned: default
@@ -55,7 +57,7 @@ final class SpeechOutput {
     /// characters: rendering runs ~50× realtime, so text is scheduled almost
     /// the moment it arrives and the queue lives in the player, not here.
     private let baseRateMultiplier: Double = 1.1
-    private let maxRateMultiplier: Double = 1.35
+    private let maxRateMultiplier: Double = 1.25
     /// Pending playback (seconds) where the rate starts climbing / tops out.
     private let rateRampStart: Double = 2.0
     private let rateRampEnd: Double = 12.0
@@ -405,7 +407,12 @@ final class SpeechOutput {
         player.scheduleBuffer(marker) { [weak self] in
             DispatchQueue.main.async {
                 guard let self, gen == self.generation else { return }
-                if !self.rendering, self.buffer.isEmpty {
+                // The queue may have grown BEHIND this marker (render runs
+                // far ahead of playback): un-ducking then would restore the
+                // original audio over a still-speaking voice. Only a truly
+                // drained pipeline counts as idle.
+                if !self.rendering, self.buffer.isEmpty,
+                   self.pendingPlaybackSeconds() < 0.1 {
                     self.scheduleUnduck()
                 }
             }

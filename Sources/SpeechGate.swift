@@ -11,17 +11,20 @@ import Foundation
 /// tentative tail — a complete sentence that has survived unchanged for a
 /// stability window is considered settled and spoken immediately.
 ///
-/// **The unit of speech is always a complete sentence, and consistency is
-/// sentence similarity — never character offsets.** The first design tracked
-/// spoken text by character count and skipped that many concluded chars;
-/// measurement showed DeepL rewrites sentences at conclusion time in the
-/// majority of cases (usually just the verb ending), and a count-based skip
-/// then leaks ending fragments ("니다.") into the voice. Instead, every
-/// spoken sentence is remembered in normalized form; when the conclusion
-/// later delivers the same sentence — even reworded — it matches by
-/// similarity and is skipped whole. A mismatch can only ever produce a
-/// complete extra sentence, not a fragment. Corrections belong to the
-/// captions, which update instantly; the voice never re-speaks.
+/// **Reconciliation is an order ledger, not text matching.** The transcript
+/// is append-only and order-preserving, so whatever was spoken early is
+/// exactly what the next conclusions deliver, in order. The gate therefore
+/// keeps a balance of early-spoken text (normalized scalars); a concluded
+/// sentence arriving against an outstanding balance IS (a rewrite of)
+/// spoken text and is skipped whole — however DeepL reworded, split, or
+/// merged it. Two earlier designs failed here: character-offset skipping
+/// leaked verb-ending fragments ("니다.") whenever a rewrite changed the
+/// length, and per-sentence similarity matching missed half the rewrites
+/// (measured), double-speaking them. The ledger never cuts a sentence and
+/// never depends on a tuned threshold; its rounding error is at most one
+/// whole sentence, and a content check on recently spoken text backstops
+/// the rare overshoot. Corrections belong to the captions, which update
+/// instantly; the voice never re-speaks.
 ///
 /// Main-thread only (matching SpeechOutput, which it feeds).
 final class SpeechGate {
@@ -33,13 +36,21 @@ final class SpeechGate {
     /// Chars of the concluded stream already moved into `assembling`.
     private var spokenConcluded = 0
     /// Concluded text still waiting for its sentence to complete. The next
-    /// delta appends here; whole sentences are extracted, deduped, spoken.
+    /// delta appends here; whole sentences are extracted, settled, spoken.
     private var assembling = ""
-    /// Normalized forms of recently spoken sentences, oldest first. `at` is
-    /// the early-speak time (nil when spoken from the conclusion), for the
-    /// conclude-lag diagnostic.
-    private var spokenRecent: [(norm: String, at: Date?)] = []
-    private let spokenRecentCap = 8
+
+    /// The ledger: normalized scalars of early-spoken text not yet claimed
+    /// by a conclusion. Also read as: the leading run of the unstable
+    /// region that is already out of the speakers.
+    private var earlyBalance = 0
+    /// Early-speak timestamps not yet claimed, for the conclude-lag metric.
+    private var earlyMarks: [Date] = []
+    /// Content backstop under the ledger: recently spoken text, normalized
+    /// and concatenated. Catches a conclusion that outgrew its balance in
+    /// rewrite, and dead-session leftovers after a reconnect reset the
+    /// ledger.
+    private var spokenTail = ""
+    private let spokenTailCap = 600 // unicode scalars, ~5-6 sentences
 
     /// Unspoken stable-sentence candidate being watched for stability.
     private var candidate = ""
@@ -62,16 +73,21 @@ final class SpeechGate {
     func reset() {
         spokenConcluded = 0
         assembling = ""
-        spokenRecent = []
+        earlyBalance = 0
+        earlyMarks = []
+        spokenTail = ""
         clearCandidate()
     }
 
-    /// The session died mid-flight: its tentative text will never conclude.
-    /// Only the candidate is dropped — `assembling` stays (the reconnect
-    /// base folds a "\n" into the concluded stream, which flushes it as a
-    /// sentence boundary), and spoken history must survive to dedup any
-    /// text the new session re-concludes.
+    /// The session died mid-flight: its tentative text will never conclude,
+    /// so the outstanding balance is written off — the reconnected session
+    /// starts a fresh transcript and its sentences must not be skipped
+    /// against a dead ledger. `assembling` stays: the reconnect base folds
+    /// a "\n" into the concluded stream, which flushes it as a sentence
+    /// boundary, and the content backstop dedups it if it was early-spoken.
     func tentativeInvalidated() {
+        earlyBalance = 0
+        earlyMarks = []
         clearCandidate()
     }
 
@@ -92,63 +108,71 @@ final class SpeechGate {
 
     // MARK: - Concluded settlement
 
-    /// Extracts whole sentences from the assembly buffer; each is either
-    /// deduped against what was already spoken early, or spoken in full.
+    /// Extracts whole sentences from the assembly buffer and settles each
+    /// against the ledger: claimed by outstanding early-spoken balance →
+    /// skip; recently spoken by content → skip; otherwise speak in full.
     private func settleAssembled() {
         let (sentences, remainder) = Self.splitSentences(assembling)
         guard !sentences.isEmpty else { return }
         assembling = remainder
         var toSpeak = ""
         for sentence in sentences {
-            if let earlyAt = consumeSpoken(matching: sentence) {
-                if let earlyAt {
-                    let ms = Int(Date().timeIntervalSince(earlyAt) * 1000)
-                    SpeechService.diag("gate conclude-lag=\(ms)ms (sentence spoken that far ahead)")
+            let size = Self.normalize(sentence).unicodeScalars.count
+            if earlyBalance > 0, earlyBalance * 2 >= size {
+                earlyBalance = max(0, earlyBalance - size)
+                if earlyBalance == 0 { earlyMarks.removeAll() }
+                else if !earlyMarks.isEmpty {
+                    let ms = Int(Date().timeIntervalSince(earlyMarks.removeFirst()) * 1000)
+                    SpeechService.diag("gate conclude-lag=\(ms)ms")
                 }
+                SpeechService.diag("gate skip(ledger) \"\(sentence.prefix(40))\"")
+            } else if wasRecentlySpoken(sentence) {
+                SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
             } else {
                 toSpeak += toSpeak.isEmpty ? sentence : " " + sentence
-                remember(sentence, at: nil)
+                rememberSpoken(sentence)
             }
         }
-        if !toSpeak.isEmpty { speak?(toSpeak) }
-    }
-
-    /// Removes and returns the spoken-history entry similar to `sentence`
-    /// (double optional: outer nil = no match / speak it; inner value = the
-    /// early-speak timestamp, nil when it was spoken from the conclusion).
-    private func consumeSpoken(matching sentence: String) -> Date?? {
-        let norm = Self.normalize(sentence)
-        // Very short sentences ("네.") legitimately repeat in meetings —
-        // never dedup them. (Scalar count: ~2-3 jamo per Hangul syllable.)
-        guard norm.unicodeScalars.count > 5 else { return .none }
-        for (i, entry) in spokenRecent.enumerated() where Self.similar(norm, entry.norm) {
-            spokenRecent.remove(at: i)
-            return .some(entry.at)
+        if !toSpeak.isEmpty {
+            SpeechService.diag("gate speak(concluded) \"\(toSpeak.prefix(60))\"")
+            speak?(toSpeak)
         }
-        return .none
     }
 
-    private func remember(_ sentence: String, at: Date?) {
-        spokenRecent.append((norm: Self.normalize(sentence), at: at))
-        if spokenRecent.count > spokenRecentCap {
-            spokenRecent.removeFirst(spokenRecent.count - spokenRecentCap)
+    /// Content backstop: the sentence's normalized form appears within
+    /// recently spoken text (six-scalar minimum so trivial echoes like a
+    /// lone "네" can't false-match).
+    private func wasRecentlySpoken(_ sentence: String) -> Bool {
+        let norm = Self.normalize(sentence)
+        return norm.unicodeScalars.count >= 6 && spokenTail.contains(norm)
+    }
+
+    private func rememberSpoken(_ sentence: String) {
+        spokenTail += Self.normalize(sentence)
+        let scalars = spokenTail.unicodeScalars
+        if scalars.count > spokenTailCap {
+            spokenTail = String(String.UnicodeScalarView(scalars.suffix(spokenTailCap)))
         }
     }
 
     // MARK: - Early speech from the unstable region
 
     /// The unstable region is the concluded-but-unfinished tail plus the
-    /// whole tentative. Complete sentences in it that were not already
-    /// spoken form the candidate; the candidate speaks once it has stayed
-    /// unchanged long enough.
+    /// whole tentative. Its leading `earlyBalance` scalars are already
+    /// spoken (order preservation again); the complete sentences after that
+    /// form the candidate, which speaks once it has stayed unchanged long
+    /// enough.
     private func considerUnstable(_ tentative: String) {
         let (sentences, remainder) = Self.splitSentences(assembling + tentative)
+        var covered = 0
         var unspoken: [String] = []
         for sentence in sentences {
-            let norm = Self.normalize(sentence)
-            if norm.unicodeScalars.count <= 5 { continue } // too short to trust early
-            if spokenRecent.contains(where: { Self.similar(norm, $0.norm) }) { continue }
-            unspoken.append(sentence)
+            let size = Self.normalize(sentence).unicodeScalars.count
+            if covered + size / 2 <= earlyBalance {
+                covered += size // ledger says this one is already out
+            } else {
+                unspoken.append(sentence)
+            }
         }
         let newCandidate = unspoken.joined(separator: " ")
         guard !newCandidate.isEmpty else {
@@ -187,11 +211,12 @@ final class SpeechGate {
 
     private func fire() {
         let stableMs = Int(Date().timeIntervalSince(candidateSince) * 1000)
-        SpeechService.diag("gate early-speak chars=\(candidate.count) stable=\(stableMs)ms")
-        let now = Date()
         for sentence in Self.splitSentences(candidate).sentences {
-            remember(sentence, at: now)
+            earlyBalance += Self.normalize(sentence).unicodeScalars.count
+            earlyMarks.append(Date())
+            rememberSpoken(sentence)
         }
+        SpeechService.diag("gate speak(early) stable=\(stableMs)ms \"\(candidate.prefix(60))\"")
         let text = candidate
         clearCandidate()
         speak?(text)
@@ -242,36 +267,13 @@ final class SpeechGate {
         return (sentences, String(text[start...]))
     }
 
-    // MARK: - Sentence similarity
-
     /// Letters and digits only, canonically decomposed — spacing and
-    /// punctuation never count as a difference, and Hangul syllables break
-    /// into jamo so that an ending rewrite ("합니다" → "하겠습니다") shares
-    /// its prefix at the jamo level ("하" ends the common run) instead of
-    /// diverging at the syllable that recomposed.
+    /// punctuation never count, and Hangul syllables break into jamo so
+    /// ledger sizes and the content backstop are stable under ending
+    /// rewrites that recompose syllables.
     static func normalize(_ text: String) -> String {
         String(text.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
             CharacterSet.alphanumerics.contains($0)
         }).lowercased()
-    }
-
-    /// Whether two normalized sentences are the same utterance, tolerating
-    /// DeepL's conclusion-time rewrites (typically the verb ending) and
-    /// partial-sentence early speech. Compared at the UNICODE SCALAR level:
-    /// Characters are grapheme clusters, which recompose the decomposed
-    /// jamo back into syllables and would hide the shared prefix again.
-    static func similar(_ x: String, _ y: String) -> Bool {
-        if x == y { return true }
-        let a = Array(x.unicodeScalars)
-        let b = Array(y.unicodeScalars)
-        let minLen = min(a.count, b.count)
-        let maxLen = max(a.count, b.count)
-        guard minLen > 0 else { return false }
-        if minLen >= 6, a.starts(with: b) || b.starts(with: a) { return true }
-        // Ending rewrite: the front agrees, the lengths are comparable.
-        // 0.55, not higher: Korean polite endings ("-ㅂ니다" ↔ "-하겠습니다")
-        // eat a large share of a short sentence's jamo.
-        let common = zip(a, b).prefix(while: ==).count
-        return Double(common) >= Double(minLen) * 0.55 && maxLen <= minLen * 2
     }
 }
