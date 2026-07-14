@@ -565,10 +565,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Interpreter captions run taller (three lines of continuity: a
         // translation trails its speech, so the surrounding lines keep it
-        // readable) and never idle-fade — a line stays until the next
-        // utterance scrolls it or its own delayed translation lands.
+        // readable). Idle-fade is on for BOTH modes now: interpreter
+        // captions follow the spoken stream, so nothing arrives late to
+        // replace a displayed line anymore — when the voice goes quiet,
+        // the caption panel should clear like any broadcast subtitle.
         subtitles.maxLines = mode == .interpreter ? 3 : 2
-        subtitles.fadeWhenIdle = mode != .interpreter
+        subtitles.fadeWhenIdle = true
         // Translation sessions have their own audio-source setting (a call
         // being interpreted usually plays through the system; a meeting is
         // usually the room mic).
