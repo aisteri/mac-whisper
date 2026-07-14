@@ -165,6 +165,11 @@ final class SpeechGate {
                 earlyBalance = max(0, earlyBalance - size)
                 consumeMarks(scalars: size)
                 SpeechService.diag("gate skip(ledger) bal=\(earlyBalance) \"\(sentence.prefix(40))\"")
+            } else if size <= 4 {
+                // Recognizer shrapnel ("음", "가방", stray fragments) — no
+                // interpretation value, and it reads as glitching. Dropped
+                // without touching the ledger.
+                SpeechService.diag("gate drop(tiny) \"\(sentence.prefix(20))\"")
             } else {
                 // Speaking against an outstanding balance means this
                 // conclusion outgrew its early-spoken sentence (merged with

@@ -595,9 +595,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 translator.appleTranslator = appleTranslator
                 // Same gate as DeepL Voice: clause-level early speech from
                 // the live line, ledger dedup, playback-synced captions.
-                translator.onSpeechStreams = { [weak self] concluded, tentative in
-                    self?.speechGate.update(concludedStream: concluded, tentative: tentative)
-                    self?.updatePendingPreview(tentative)
+                translator.onSpeechStreams = { [weak self] concluded, stable, preview in
+                    self?.speechGate.update(concludedStream: concluded, tentative: stable)
+                    self?.updatePendingPreview(preview)
                 }
                 let source = AppleTranslator.localeLanguage(forPrompt: settings.interpreterSourceLanguage)
                 let target = AppleTranslator.localeLanguage(forPrompt: settings.interpreterTargetLanguage)

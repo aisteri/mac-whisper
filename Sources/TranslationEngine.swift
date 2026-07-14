@@ -83,15 +83,18 @@ final class TranslationEngine {
     var onSpeakableTranslation: ((String) -> Void)?
 
     /// Gate-mode alternative to onSpeakableTranslation (set → that one is
-    /// suppressed): the same DeepL-Voice-shaped stream pair SpeechGate
-    /// consumes. `concluded` grows append-only — each utterance's
-    /// translation is stamped in the moment it first becomes speakable —
-    /// and `tentative` is the live line's current translation (never its
-    /// untranslated source: a dead translator must not put the original
-    /// language on the speakers). This buys the live line clause-level
-    /// early speech and playback-synced captions, and puts the ledger in
-    /// charge of dedup instead of per-utterance heuristics.
-    var onSpeechStreams: ((_ concluded: String, _ tentative: String) -> Void)?
+    /// suppressed): the DeepL-Voice-shaped streams SpeechGate consumes.
+    /// `concluded` grows append-only — each utterance's translation is
+    /// stamped in the moment it first becomes speakable. `stable` is the
+    /// live line's COMMITTED prefix (local agreement: two consecutive
+    /// re-translations agreed on it) — the full live text is useless to
+    /// the gate because every re-translation rewrites it wholesale, so it
+    /// never survives a stability window; the agreed prefix is the "short
+    /// units, locked" currency the gate can speak early. `preview` is the
+    /// full live translation for the caption's dimmed line. Never the
+    /// untranslated source — a dead translator must not put the original
+    /// language on the speakers.
+    var onSpeechStreams: ((_ concluded: String, _ stable: String, _ preview: String) -> Void)?
     private var concludedSpeech = ""
 
     /// One styled caption run: `committed` text renders white, else dimmed.
@@ -549,12 +552,21 @@ final class TranslationEngine {
         }
     }
 
-    /// Publishes the stream pair; called whenever the concluded stream grew
+    /// Publishes the streams; called whenever the concluded stream grew
     /// or the live translation changed (render covers the latter).
     private func notifySpeechStreams() {
         guard let onSpeechStreams else { return }
-        let live = utterances.last.flatMap { $0.sealed ? nil : $0.translation.text } ?? ""
-        onSpeechStreams(concludedSpeech, live)
+        var stable = ""
+        var preview = ""
+        if let u = utterances.last, !u.sealed {
+            if case .draft(let text, let committed) = u.translation {
+                stable = String(text.prefix(committed))
+                preview = text
+            } else if let text = u.translation.text {
+                preview = text
+            }
+        }
+        onSpeechStreams(concludedSpeech, stable, preview)
     }
 
     // MARK: - Local agreement
