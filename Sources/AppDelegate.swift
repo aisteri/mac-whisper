@@ -30,20 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var voiceSourceFull = ""
     private var voiceTargetFull = ""
     /// Everything the gate has SETTLED (handed to the voice queue), in
-    /// order — the caption's white stream. Text turns white the moment it
-    /// settles, not when playback reaches it: the gap between those two
-    /// events left settled text invisible ("captions skipped ahead").
-    /// Append-only; renderGateCaption asserts that invariant.
-    private var settledStream = ""
-    /// The playback-finished part of the settled stream (playhead base).
-    private var voiceSpokenCaption = ""
-    /// The utterance the speakers are on right now, and the play head's
-    /// character position within it (karaoke highlight).
-    private var speakingText = ""
-    private var speakingUpTo = 0
-    /// The gate's unspoken tail (+ any not-yet-agreed translation), shown
-    /// grey after the settled stream.
-    private var pendingGray = ""
+    /// order — the caption state machine (white/yellow/grey boundaries).
+    /// Extracted into CaptionModel so its invariants run in the test
+    /// harness — screen bugs must be caught by tests, not the user's eyes.
+    private let caption = CaptionModel()
     /// True while the speech gate owns the captions (DeepL Voice and Apple
     /// interpreter sessions); the LLM path keeps grey/white agreement runs.
     private var gateDrivesCaptions = false
@@ -352,11 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // White the moment it settles — playback only moves the yellow
             // boundary later.
             if self.gateDrivesCaptions {
-                self.settledStream += self.settledStream.isEmpty ? text : " " + text
-                if self.settledStream.count > 4000 {
-                    self.settledStream = String(self.settledStream.suffix(2000))
-                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(2000))
-                }
+                self.caption.settle(text)
                 self.renderGateCaption()
             }
         }
@@ -366,41 +352,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // still-unspoken text away.
         speechOutput.onPlaybackReached = { [weak self] text in
             guard let self else { return }
-            // The previous utterance finished playing; it graduates into
-            // the spoken tail and the new one takes the highlight.
-            if !self.speakingText.isEmpty {
-                self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty
-                    ? self.speakingText : " " + self.speakingText
-                if self.voiceSpokenCaption.count > 2000 {
-                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(1000))
-                }
-            }
-            self.speakingText = text
-            self.speakingUpTo = 0
+            self.caption.playbackReached(text)
             self.renderGateCaption()
         }
         speechOutput.onSpeakingProgress = { [weak self] text, upTo in
             guard let self else { return }
-            if text.isEmpty {
-                // Playback drained — the last utterance graduates.
-                if !self.speakingText.isEmpty {
-                    self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty
-                        ? self.speakingText : " " + self.speakingText
-                    self.speakingText = ""
-                    self.speakingUpTo = 0
-                    self.renderGateCaption()
-                }
-            } else {
-                if text != self.speakingText { self.speakingText = text }
-                self.speakingUpTo = upTo
-                self.renderGateCaption()
-            }
+            self.caption.progress(text: text, upTo: upTo)
+            self.renderGateCaption()
         }
         // Captions must never idle-fade while the voice is mid-sentence OR
         // while transcription is still feeding the grey tail.
         subtitles.isBusy = { [weak self] in
             guard let self else { return false }
-            return self.speechOutput.isSpeaking || !self.pendingGray.isEmpty
+            return self.speechOutput.isSpeaking || !self.caption.grey.isEmpty
         }
         longForm.onFinished = { [weak self] text in self?.handleLockedFinished(text) }
         longForm.onStatus = { [weak self] status in
@@ -593,9 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // grows; the Apple path's doesn't. Not a tuning problem.
             speechGate.earlySpeech = settings.earlySpeechEnabled
                 && !settings.appleTranslationEnabled
-            voiceSpokenCaption = ""
-            settledStream = ""; lastSettledCount = 0
-            speakingText = ""; speakingUpTo = 0; pendingGray = ""
+            caption.reset(); lastSettledCount = 0
             // The gate drives speech AND captions for the stream-shaped
             // providers (DeepL Voice, Apple); the LLM path keeps the legacy
             // per-utterance hand-off and grey/white captions.
@@ -619,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // duplicates text).
                     let beyond = String(preview.dropFirst(stable.count))
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.pendingGray = [self.speechGate.pendingText, beyond]
+                    self.caption.grey = [self.speechGate.pendingText, beyond]
                         .filter { !$0.isEmpty }.joined(separator: " ")
                     self.renderGateCaption()
                 }
@@ -909,7 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // their conclusion. The concluded stream survives reconnects
             // via the base, so its char counts never go stale.
             self.speechGate.update(concludedStream: self.voiceTargetFull, tentative: tentative)
-            self.pendingGray = self.speechGate.pendingText
+            self.caption.grey = self.speechGate.pendingText
             self.renderGateCaption()
         }
         session.onError = { [weak self] message in
@@ -958,18 +920,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard gateDrivesCaptions else { return }
         // Invariant: the white stream only ever grows. A shrink means a
         // caption-state bug of the "text vanished" family — log it loudly.
-        if settledStream.count < lastSettledCount, settledStream.count > 0 {
-            SpeechService.diag("caption INVARIANT VIOLATED: settled shrank \(lastSettledCount) -> \(settledStream.count)")
+        if caption.settled.count < lastSettledCount, caption.settled.count > 0 {
+            SpeechService.diag("caption INVARIANT VIOLATED: settled shrank \(lastSettledCount) -> \(caption.settled.count)")
         }
-        lastSettledCount = settledStream.count
-        // Playhead: finished utterances plus the current one's progress,
-        // clamped — its coordinates track the enqueue stream, which can
-        // differ from settledStream by a few join spaces.
-        let played = voiceSpokenCaption.count
-            + (speakingText.isEmpty ? 0 : 1 + speakingUpTo)
-        subtitles.updateKaraoke(settled: settledStream,
-                                playedChars: min(played, settledStream.count),
-                                grey: pendingGray)
+        lastSettledCount = caption.settled.count
+        subtitles.updateKaraoke(settled: caption.settled,
+                                playedChars: caption.playedChars,
+                                grey: caption.grey)
     }
 
     private func handleVoiceError(_ message: String, from session: DeepLVoiceSession) {
