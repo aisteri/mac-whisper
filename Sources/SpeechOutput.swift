@@ -36,6 +36,12 @@ final class SpeechOutput {
     var isSpeaking: Bool {
         rendering || !buffer.isEmpty || pendingPlaybackSeconds() > 0.1
     }
+
+    /// Karaoke feed: fired ~10×/s on main with the utterance being heard
+    /// RIGHT NOW and how many of its characters playback has passed
+    /// (uniform frame→character interpolation — close enough for a caption
+    /// highlight). Fired once with ("", 0) when playback drains.
+    var onSpeakingProgress: ((_ text: String, _ upTo: Int) -> Void)?
     /// Duck the system output while speaking; restore when the voice idles.
     var duckOthers = false
     /// BCP 47 tag choosing the voice, e.g. "ko-KR".
@@ -116,6 +122,15 @@ final class SpeechOutput {
     /// Utterance text awaiting its playback-start marker (set by pump,
     /// consumed by the first rendered buffer of that utterance).
     private var pendingAnnounce: String?
+    /// The utterance currently being RENDERED: its text and the frame
+    /// offset where its audio starts. Finalized into `playbackQueue` when
+    /// rendering completes and its total length is known.
+    private var renderingUtterance: (text: String, startFrame: Double)?
+    /// Fully rendered utterances whose audio is still queued/playing —
+    /// (text, startFrame, totalFrames) against the scheduledFrames clock.
+    /// The progress timer maps the play head into character positions.
+    private var playbackQueue: [(text: String, startFrame: Double, totalFrames: Double)] = []
+    private var progressTimer: Timer?
     /// When the oldest unspoken text arrived (buffer was empty), for the
     /// queue-wait diagnostic; nil while nothing waits.
     private var oldestEnqueueAt: Date?
@@ -146,6 +161,7 @@ final class SpeechOutput {
         SpeechService.diag("speech output device changed — reconnecting engine")
         player.stop()
         scheduledFrames = 0
+        clearProgress()
         if let format = connectedFormat {
             engine.connect(player, to: engine.mainMixerNode, format: format)
         }
@@ -208,6 +224,7 @@ final class SpeechOutput {
         rendering = false
         scheduledFrames = 0
         pendingAnnounce = nil
+        clearProgress()
         oldestEnqueueAt = nil
         utteranceStartedAt = nil
         cachedVoice = nil
@@ -288,7 +305,49 @@ final class SpeechOutput {
     private func renderFinished(gen: Int) {
         guard gen == generation else { return }
         rendering = false
+        if let u = renderingUtterance {
+            playbackQueue.append((u.text, u.startFrame, scheduledFrames - u.startFrame))
+            renderingUtterance = nil
+        }
         pump() // no-op when the buffer is empty
+    }
+
+    // MARK: - Playback progress (caption karaoke)
+
+    private func startProgressTimer() {
+        guard progressTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.tickProgress()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        progressTimer = timer
+    }
+
+    private func tickProgress() {
+        guard let nodeTime = player.lastRenderTime,
+              let playerTime = player.playerTime(forNodeTime: nodeTime) else { return }
+        let played = Double(playerTime.sampleTime)
+        // Drop utterances playback has fully passed.
+        while let first = playbackQueue.first, played >= first.startFrame + first.totalFrames {
+            playbackQueue.removeFirst()
+        }
+        if let current = playbackQueue.first, played >= current.startFrame, current.totalFrames > 0 {
+            let progress = (played - current.startFrame) / current.totalFrames
+            let upTo = min(current.text.count, Int((progress * Double(current.text.count)).rounded()))
+            onSpeakingProgress?(current.text, upTo)
+        } else if playbackQueue.isEmpty, renderingUtterance == nil, !isSpeaking {
+            onSpeakingProgress?("", 0)
+            progressTimer?.invalidate()
+            progressTimer = nil
+        }
+    }
+
+    private func clearProgress() {
+        playbackQueue = []
+        renderingUtterance = nil
+        progressTimer?.invalidate()
+        progressTimer = nil
+        onSpeakingProgress?("", 0)
     }
 
     /// Seconds of audio scheduled but not yet played out.
@@ -374,6 +433,10 @@ final class SpeechOutput {
         // so onPlaybackReached fires when the SPEAKERS reach this text.
         let announce = pendingAnnounce
         pendingAnnounce = nil
+        if let announce {
+            renderingUtterance = (announce, scheduledFrames)
+            startProgressTimer()
+        }
         if connectedFormat != pcm.format {
             engine.connect(player, to: engine.mainMixerNode, format: pcm.format)
             connectedFormat = pcm.format

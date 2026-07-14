@@ -54,6 +54,7 @@ final class SubtitleOverlay {
     /// stale line on screen that reads as if it were still being said. New
     /// content brings it right back.
     private var lastContent = ""
+    private var lastHighlight = 0
     private var lastContentAt = Date.distantPast
     private var idleTimer: Timer?
     /// 12 s, not shorter: interpreter captions update only when the voice
@@ -225,29 +226,66 @@ final class SubtitleOverlay {
         return result
     }
 
-    /// Interpreter-mode captions: styled runs concatenated verbatim — line
-    /// breaks arrive inside the run text, so a single line can mix a white
-    /// (committed) prefix with a dimmed still-moving remainder, hardening a
-    /// few words at a time like professional live captions.
+    /// One caption run's role in the karaoke model.
+    enum CaptionStyle {
+        /// Already voiced — white.
+        case spoken
+        /// Being voiced right now: characters up to `upTo` highlighted
+        /// (the play head), the rest white.
+        case speaking(upTo: Int)
+        /// Not voiced yet (latest translation preview) — dimmed.
+        case pending
+    }
+
+    /// Legacy two-tone entry point (LLM path, agreement captions).
     func update(pieces: [(text: String, isFinal: Bool)]) {
+        update(styledPieces: pieces.map { ($0.text, $0.isFinal ? .spoken : .pending) })
+    }
+
+    /// Interpreter-mode captions: styled runs concatenated verbatim — line
+    /// breaks arrive inside the run text. The karaoke highlight moves many
+    /// times a second, so identical-text updates that only shift the
+    /// highlight skip measuring/layout and just restyle the field.
+    func update(styledPieces pieces: [(text: String, style: CaptionStyle)]) {
         guard armed else { return }
         guard pieces.contains(where: { $0.text.contains(where: { $0.isLetter || $0.isNumber }) }) else { return }
 
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
+        let base: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: paragraph]
         let styled = NSMutableAttributedString()
+        var highlightKey = 0
         for piece in pieces {
-            styled.append(NSAttributedString(string: piece.text, attributes: [
-                .font: font,
-                .foregroundColor: piece.isFinal ? NSColor.white : NSColor.white.withAlphaComponent(0.55),
-                .paragraphStyle: paragraph,
-            ]))
+            switch piece.style {
+            case .spoken:
+                styled.append(NSAttributedString(string: piece.text, attributes:
+                    base.merging([.foregroundColor: NSColor.white]) { a, _ in a }))
+            case .speaking(let upTo):
+                highlightKey = upTo
+                let chars = Array(piece.text)
+                let cut = max(0, min(chars.count, upTo))
+                styled.append(NSAttributedString(string: String(chars[..<cut]), attributes:
+                    base.merging([.foregroundColor: NSColor.systemYellow]) { a, _ in a }))
+                styled.append(NSAttributedString(string: String(chars[cut...]), attributes:
+                    base.merging([.foregroundColor: NSColor.white]) { a, _ in a }))
+            case .pending:
+                styled.append(NSAttributedString(string: piece.text, attributes:
+                    base.merging([.foregroundColor: NSColor.white.withAlphaComponent(0.55)]) { a, _ in a }))
+            }
         }
-        // Only a content CHANGE resets the idle clock and re-reveals the
-        // panel — repeated emits of the same text must not resurrect a
-        // caption that idle-faded during a pause.
-        guard styled.string != lastContent else { return }
+        // Same text + same highlight position: nothing to do. Same text
+        // with a MOVED highlight: restyle only — measuring and reframing
+        // the panel 10×/s would burn CPU for identical geometry. Only a
+        // real content change resets the idle clock and re-reveals (so
+        // repeated emits can't resurrect an idle-faded caption).
+        if styled.string == lastContent {
+            guard highlightKey != lastHighlight else { return }
+            lastHighlight = highlightKey
+            textField.attributedStringValue = styled
+            return
+        }
         lastContent = styled.string
+        lastHighlight = highlightKey
         lastContentAt = Date()
         flashGen &+= 1
         textField.attributedStringValue = styled

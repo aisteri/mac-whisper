@@ -32,6 +32,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// What the gate has actually sent to the voice — the caption source in
     /// gate-driven modes, so screen and speech always agree.
     private var voiceSpokenCaption = ""
+    /// The utterance the speakers are on right now, and the play head's
+    /// character position within it (karaoke highlight).
+    private var speakingText = ""
+    private var speakingUpTo = 0
+    /// Newest unstable translation, shown dimmed below the spoken lines.
+    private var pendingPreview = ""
     /// True while the speech gate owns the captions (DeepL Voice and Apple
     /// interpreter sessions); the LLM path keeps grey/white agreement runs.
     private var gateDrivesCaptions = false
@@ -348,7 +354,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // falls behind, the captions wait with it instead of scrolling the
         // still-unspoken text away.
         speechOutput.onPlaybackReached = { [weak self] text in
-            self?.appendVoiceCaption(text)
+            guard let self else { return }
+            // The previous utterance finished playing; it graduates into
+            // the spoken tail and the new one takes the highlight.
+            if !self.speakingText.isEmpty {
+                self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty
+                    ? self.speakingText : " " + self.speakingText
+                if self.voiceSpokenCaption.count > 2000 {
+                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(1000))
+                }
+            }
+            self.speakingText = text
+            self.speakingUpTo = 0
+            self.renderGateCaption()
+        }
+        speechOutput.onSpeakingProgress = { [weak self] text, upTo in
+            guard let self else { return }
+            if text.isEmpty {
+                // Playback drained — the last utterance graduates.
+                if !self.speakingText.isEmpty {
+                    self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty
+                        ? self.speakingText : " " + self.speakingText
+                    self.speakingText = ""
+                    self.speakingUpTo = 0
+                    self.renderGateCaption()
+                }
+            } else {
+                if text != self.speakingText { self.speakingText = text }
+                self.speakingUpTo = upTo
+                self.renderGateCaption()
+            }
         }
         // Captions must never idle-fade while the voice is mid-sentence:
         // their content clock only ticks when a sentence STARTS playing.
@@ -545,6 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             speechGate.earlySpeech = settings.earlySpeechEnabled
                 && !settings.appleTranslationEnabled
             voiceSpokenCaption = ""
+            speakingText = ""; speakingUpTo = 0; pendingPreview = ""
             // The gate drives speech AND captions for the stream-shaped
             // providers (DeepL Voice, Apple); the LLM path keeps the legacy
             // per-utterance hand-off and grey/white captions.
@@ -561,6 +597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // the live line, ledger dedup, playback-synced captions.
                 translator.onSpeechStreams = { [weak self] concluded, tentative in
                     self?.speechGate.update(concludedStream: concluded, tentative: tentative)
+                    self?.updatePendingPreview(tentative)
                 }
                 let source = AppleTranslator.localeLanguage(forPrompt: settings.interpreterSourceLanguage)
                 let target = AppleTranslator.localeLanguage(forPrompt: settings.interpreterTargetLanguage)
@@ -848,6 +885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // their conclusion. The concluded stream survives reconnects
             // via the base, so its char counts never go stale.
             self.speechGate.update(concludedStream: self.voiceTargetFull, tentative: tentative)
+            self.updatePendingPreview(tentative)
         }
         session.onError = { [weak self] message in
             self?.handleVoiceError(message, from: session)
@@ -893,8 +931,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if voiceSpokenCaption.count > 2000 {
             voiceSpokenCaption = String(voiceSpokenCaption.suffix(1000))
         }
-        subtitles.update(pieces: Self.voiceCaptionPieces(
-            concluded: voiceSpokenCaption, tentative: ""))
+        renderGateCaption()
+    }
+
+    /// Karaoke caption: a spoken tail (white), the utterance being heard
+    /// right now (highlighted up to the play head), and the newest
+    /// still-unspoken translation as a dimmed preview line — so the eyes
+    /// never wait for the voice, and the voice's position is visible.
+    private func renderGateCaption() {
+        guard gateDrivesCaptions else { return }
+        var pieces: [(text: String, style: SubtitleOverlay.CaptionStyle)] = []
+        let (sentences, remainder) = SpeechGate.splitSentences(voiceSpokenCaption)
+        let keep = speakingText.isEmpty ? 2 : 1
+        let spokenTail = (sentences.suffix(keep) + [remainder])
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !spokenTail.isEmpty {
+            pieces.append((spokenTail, .spoken))
+        }
+        if !speakingText.isEmpty {
+            pieces.append(((spokenTail.isEmpty ? "" : "\n") + speakingText,
+                           .speaking(upTo: speakingUpTo + (spokenTail.isEmpty ? 0 : 1))))
+        }
+        if !pendingPreview.isEmpty, pieces.isEmpty || pendingPreview != speakingText {
+            pieces.append(((pieces.isEmpty ? "" : "\n") + pendingPreview, .pending))
+        }
+        guard !pieces.isEmpty else { return }
+        subtitles.update(styledPieces: pieces)
+    }
+
+    /// The dimmed preview line: the newest unstable translation's last
+    /// sentence-in-progress.
+    private func updatePendingPreview(_ tentative: String) {
+        guard gateDrivesCaptions else { return }
+        let (sentences, remainder) = SpeechGate.splitSentences(tentative)
+        let preview = (sentences.suffix(1) + [remainder])
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingPreview = String(preview.suffix(120))
+        renderGateCaption()
     }
 
     private func handleVoiceError(_ message: String, from session: DeepLVoiceSession) {
