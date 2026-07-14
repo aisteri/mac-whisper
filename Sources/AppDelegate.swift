@@ -574,13 +574,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
             }
             speechGate.reset()
-            // Early speech on for BOTH stream providers. The Apple path's
-            // rewrite storms once made this produce triple readings, but
-            // dedup now runs at three layers (source-level, order ledger,
-            // neighbor similarity) and the user chose speed-with-locked
-            // output over waiting for polished conclusions: once a clause
-            // is voiced it is FIXED — later rewrites are ignored.
+            // Early speech is DeepL-only, permanently. Two designs tried to
+            // early-speak the Apple path — the raw live translation, then
+            // the local-agreement committed prefix — and both re-read whole
+            // rewritten sentences in production, because the recognizer
+            // hypothesis flips and the re-translation (agreement included)
+            // restarts from scratch. Early speech requires a stream that
+            // grows; the Apple path's doesn't. Not a tuning problem.
             speechGate.earlySpeech = settings.earlySpeechEnabled
+                && !settings.appleTranslationEnabled
             voiceSpokenCaption = ""
             speakingText = ""; speakingUpTo = 0; pendingGray = ""
             // The gate drives speech AND captions for the stream-shaped

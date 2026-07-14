@@ -330,8 +330,15 @@ final class SubtitleOverlay {
 
         let textWidth = karaokeTextWidth()
         let ns = full as NSString
-        let starts = karaokeLineStarts(full, width: textWidth)
-        let visibleStart = starts.count >= 3 ? starts[starts.count - 3] : 0
+        // Anchor the visible window on the SETTLED stream only: settled is
+        // append-only, so the window moves in whole-line steps and the
+        // yellow/white text never shifts. Anchoring on the full text let
+        // every grey rewrite change the line count and drag the settled
+        // words around (observed: "already-yellow text jumping/vanishing").
+        // The grey tail flows after the window and may clip at the box
+        // bottom — fine, it hardens into the stable window as it settles.
+        let starts = karaokeLineStarts(settled, width: textWidth)
+        let visibleStart = starts.count >= 2 ? starts[starts.count - 2] : 0
 
         // Boundaries in UTF-16, global to the full text.
         let settledEndU = (settled as NSString).length

@@ -534,7 +534,7 @@ final class TranslationEngine {
         if let source = utterances.first(where: { $0.id == id })?.source {
             let norm = SpeechGate.normalize(source)
             if norm.unicodeScalars.count >= 10,
-               spokenSources.contains(where: { SpeechGate.bigramSimilar(norm, $0) }) {
+               spokenSources.contains(where: { SpeechGate.bigramSimilar(norm, $0, threshold: 0.5) }) {
                 SpeechService.diag("translate dedup(source) \"\(text.prefix(40))\"")
                 return
             }

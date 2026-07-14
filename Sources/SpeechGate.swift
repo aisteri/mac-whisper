@@ -463,7 +463,7 @@ final class SpeechGate {
     /// overlap, which survives reordering that defeats prefix comparison.
     /// 0.65, deliberately strict: structurally parallel but DIFFERENT
     /// neighboring sentences ("매출은 90만" / "지출은 80만") must not match.
-    static func bigramSimilar(_ x: String, _ y: String) -> Bool {
+    static func bigramSimilar(_ x: String, _ y: String, threshold: Double = 0.65) -> Bool {
         let a = Array(x.unicodeScalars), b = Array(y.unicodeScalars)
         // Length ratio ≤1.3: a REWRITE keeps roughly the same size. A
         // conclusion that merged NEW content past what was spoken is
@@ -480,7 +480,7 @@ final class SpeechGate {
         let ba = bigrams(a), bb = bigrams(b)
         let inter = ba.intersection(bb).count
         let union = ba.union(bb).count
-        return union > 0 && Double(inter) / Double(union) >= 0.65
+        return union > 0 && Double(inter) / Double(union) >= threshold
     }
 
     /// Whether two NORMALIZED strings are light rewrites of each other —
