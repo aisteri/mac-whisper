@@ -281,7 +281,10 @@ final class LongFormTranscriber {
     private var lastBufferAt = Date.distantFuture
     private var captureWatchdogTimer: Timer?
     private var captureRestartInFlight = false
-    private let captureStallTimeout: TimeInterval = 5
+    /// 3 s: even silence delivers level-0 buffers, so any real gap means
+    /// the stream is dead — and every second here is lost interpretation
+    /// audio (the restart itself adds ~1 s).
+    private let captureStallTimeout: TimeInterval = 3
 
     private func startCaptureWatchdog() {
         captureWatchdogTimer?.invalidate()
@@ -308,7 +311,6 @@ final class LongFormTranscriber {
         }
         captureRestartInFlight = true
         SpeechService.diag("capture watchdog: no buffers for \(Int(captureStallTimeout))s — restarting system capture")
-        DispatchQueue.main.async { [weak self] in self?.onStatus?("Audio capture stalled — restarting…") }
         stateLock.lock()
         let stream = scStream
         scStream = nil
@@ -320,8 +322,14 @@ final class LongFormTranscriber {
             do {
                 try await self.startSystemCapture(reopenBackup: false)
                 SpeechService.diag("capture watchdog: system capture restarted")
+                // Silent recovery: this is routine SCStream babysitting
+                // (dozens of times per meeting), not something the user
+                // should be alarmed about. Only a FAILED restart surfaces.
             } catch {
                 SpeechService.diag("capture watchdog: restart FAILED: \(error)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.onStatus?("Audio capture lost — trying to recover…")
+                }
             }
             self.stateLock.lock()
             self.lastBufferAt = Date() // re-arm; don't refire instantly
