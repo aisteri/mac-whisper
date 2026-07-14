@@ -226,14 +226,21 @@ final class SpeechGate {
             // clause delivery traded for keeping pace (user's call); the
             // ledger reconciles the conclusion by size, so no dedup worry.
             let clause = Self.clauseBoundedPrefix(of: tail)
-            if !clause.isEmpty { pieces.append(clause) }
+            // Clause by clause, NOT as one block: all-or-nothing coverage
+            // re-spoke an already-voiced leading clause whenever a rewrite
+            // grew the block past the balance (observed twice in one
+            // session — "그러면 앞서…" spoken again inside its extension).
+            if !clause.isEmpty { pieces.append(contentsOf: Self.splitClauses(clause)) }
         }
         var covered = 0
         var unspoken: [String] = []
         for piece in pieces {
-            let size = Self.normalize(piece).unicodeScalars.count
+            let norm = Self.normalize(piece)
+            let size = norm.unicodeScalars.count
             if covered + size / 2 <= earlyBalance {
                 covered += size // ledger says this one is already out
+            } else if size >= 6, spokenTail.contains(norm) {
+                continue // content evidence: spoken verbatim, size drifted
             } else {
                 unspoken.append(piece)
             }
