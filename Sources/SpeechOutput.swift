@@ -29,6 +29,13 @@ final class SpeechOutput {
     /// captions keyed to this stay in step with what is being heard: when
     /// the voice falls behind, the captions wait with it.
     var onPlaybackReached: ((String) -> Void)?
+
+    /// True while the voice is audibly busy: rendering, audio still queued
+    /// in the player, or text waiting. The caption overlay asks this before
+    /// idle-fading — captions must never vanish mid-speech.
+    var isSpeaking: Bool {
+        rendering || !buffer.isEmpty || pendingPlaybackSeconds() > 0.1
+    }
     /// Duck the system output while speaking; restore when the voice idles.
     var duckOthers = false
     /// BCP 47 tag choosing the voice, e.g. "ko-KR".

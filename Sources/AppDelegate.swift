@@ -350,6 +350,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speechOutput.onPlaybackReached = { [weak self] text in
             self?.appendVoiceCaption(text)
         }
+        // Captions must never idle-fade while the voice is mid-sentence:
+        // their content clock only ticks when a sentence STARTS playing.
+        subtitles.isBusy = { [weak self] in
+            self?.speechOutput.isSpeaking ?? false
+        }
         longForm.onFinished = { [weak self] text in self?.handleLockedFinished(text) }
         longForm.onStatus = { [weak self] status in
             self?.transcriptWindow.setStatus(status)

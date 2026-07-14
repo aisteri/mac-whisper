@@ -149,11 +149,18 @@ final class SubtitleOverlay {
         })
     }
 
+    /// When set, the overlay never idle-fades while this returns true —
+    /// the caption content only updates as each sentence STARTS playing,
+    /// so during a long utterance the content clock goes stale while the
+    /// voice is still audibly mid-sentence.
+    var isBusy: (() -> Bool)?
+
     private func startIdleTimer() {
         idleTimer?.invalidate()
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self, self.fadeWhenIdle, self.armed, self.panel.isVisible,
                   self.lastContentAt != .distantPast,
+                  !(self.isBusy?() ?? false),
                   Date().timeIntervalSince(self.lastContentAt) >= self.idleFadeAfter else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.4
@@ -162,6 +169,7 @@ final class SubtitleOverlay {
                 guard let self, self.armed,
                       // New content may have arrived (and re-revealed the
                       // panel) while the fade ran — don't yank it back out.
+                      !(self.isBusy?() ?? false),
                       Date().timeIntervalSince(self.lastContentAt) >= self.idleFadeAfter else { return }
                 self.panel.orderOut(nil)
             })
