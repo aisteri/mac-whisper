@@ -329,17 +329,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speechGate.speak = { [weak self] text in
             guard let self else { return }
             self.speechOutput.enqueue(text)
-            // DeepL streaming mode: the caption IS the spoken stream —
-            // screen and voice always agree, and settled text appears
-            // ahead of DeepL's conclusion instead of flickering grey.
-            if self.longForm.bypassAnalyzer {
-                self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty ? text : " " + text
-                if self.voiceSpokenCaption.count > 2000 {
-                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(1000))
-                }
-                self.subtitles.update(pieces: Self.voiceCaptionPieces(
-                    concluded: self.voiceSpokenCaption, tentative: ""))
+            // With TTS off there is no playback to key the captions to —
+            // show the settled text as soon as the gate clears it.
+            if !self.speechOutput.enabled {
+                self.appendVoiceCaption(text)
             }
+        }
+        // DeepL streaming mode: the caption IS the spoken stream, keyed to
+        // PLAYBACK — screen and voice always agree, and when the voice
+        // falls behind, the captions wait with it instead of scrolling the
+        // still-unspoken text away.
+        speechOutput.onPlaybackReached = { [weak self] text in
+            self?.appendVoiceCaption(text)
         }
         longForm.onFinished = { [weak self] text in self?.handleLockedFinished(text) }
         longForm.onStatus = { [weak self] status in
@@ -843,6 +844,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async { launch(glossaryID) }
             }
         }
+    }
+
+    /// Appends spoken (or gate-settled, when TTS is off) text to the
+    /// streaming-mode caption and redraws it.
+    private func appendVoiceCaption(_ text: String) {
+        guard longForm.bypassAnalyzer else { return }
+        voiceSpokenCaption += voiceSpokenCaption.isEmpty ? text : " " + text
+        if voiceSpokenCaption.count > 2000 {
+            voiceSpokenCaption = String(voiceSpokenCaption.suffix(1000))
+        }
+        subtitles.update(pieces: Self.voiceCaptionPieces(
+            concluded: voiceSpokenCaption, tentative: ""))
     }
 
     private func handleVoiceError(_ message: String, from session: DeepLVoiceSession) {

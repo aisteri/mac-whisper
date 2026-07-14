@@ -24,6 +24,11 @@ import Foundation
 final class SpeechOutput {
     /// Master switch; when off, enqueue() is a no-op.
     var enabled = false
+    /// Fired on main when PLAYBACK actually reaches each utterance — not
+    /// when it was queued. Rendering runs far ahead of the speakers, so
+    /// captions keyed to this stay in step with what is being heard: when
+    /// the voice falls behind, the captions wait with it.
+    var onPlaybackReached: ((String) -> Void)?
     /// Duck the system output while speaking; restore when the voice idles.
     var duckOthers = false
     /// BCP 47 tag choosing the voice, e.g. "ko-KR".
@@ -99,6 +104,9 @@ final class SpeechOutput {
     /// Frames handed to the player since it last started, against
     /// player.playerTime — their difference is the unplayed backlog.
     private var scheduledFrames: Double = 0
+    /// Utterance text awaiting its playback-start marker (set by pump,
+    /// consumed by the first rendered buffer of that utterance).
+    private var pendingAnnounce: String?
     /// When the oldest unspoken text arrived (buffer was empty), for the
     /// queue-wait diagnostic; nil while nothing waits.
     private var oldestEnqueueAt: Date?
@@ -194,6 +202,7 @@ final class SpeechOutput {
         buffer = ""
         rendering = false
         scheduledFrames = 0
+        pendingAnnounce = nil
         oldestEnqueueAt = nil
         utteranceStartedAt = nil
         cachedVoice = nil
@@ -241,6 +250,7 @@ final class SpeechOutput {
         let ramp = min(1.0, max(0.0, (pending - rateRampStart) / (rateRampEnd - rateRampStart)))
         let multiplier = baseRateMultiplier + (maxRateMultiplier - baseRateMultiplier) * ramp
         utteranceStartedAt = Date()
+        pendingAnnounce = text
         SpeechService.diag(String(format: "tts pump chars=%d pending=%.1fs rate=%.2f wait=%dms",
                                   text.count, pending, multiplier, waitMs))
 
@@ -366,6 +376,10 @@ final class SpeechOutput {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             if ms > 250 { SpeechService.diag("tts render-start=\(ms)ms") }
         }
+        // First buffer of an utterance: drop a start marker in front of it,
+        // so onPlaybackReached fires when the SPEAKERS reach this text.
+        let announce = pendingAnnounce
+        pendingAnnounce = nil
         if connectedFormat != pcm.format {
             engine.connect(player, to: engine.mainMixerNode, format: pcm.format)
             connectedFormat = pcm.format
@@ -394,6 +408,16 @@ final class SpeechOutput {
             }
         }
         if !player.isPlaying { player.play() }
+        if let announce, let format = connectedFormat,
+           let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) {
+            marker.frameLength = 1
+            player.scheduleBuffer(marker) { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, gen == self.generation else { return }
+                    self.onPlaybackReached?(announce)
+                }
+            }
+        }
         player.scheduleBuffer(pcm)
         scheduledFrames += Double(pcm.frameLength)
     }
