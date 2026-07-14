@@ -229,7 +229,44 @@ final class TranslationEngine {
     /// live line may now be sealed.
     func feed(_ text: String, stableLength: Int) {
         var lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        let liveSource: String? = text.hasSuffix("\n") ? nil : lines.popLast()
+        var liveSource: String? = text.hasSuffix("\n") ? nil : lines.popLast()
+
+        // Apple path: use the transcriber's FINAL boundary, not just the
+        // seal. `stableLength` marks the prefix the recognizer will never
+        // rewrite. Two things follow (both were being wasted):
+        //  1. A sentence COMPLETED inside the final region needs no seal —
+        //     a speaker running on for a minute used to settle nothing and
+        //     the voice stayed silent for whole paragraphs. Promote such
+        //     sentences to utterances right away. The promotion is a pure
+        //     function of (text, stableLength), and stableLength only
+        //     grows, so every feed re-derives the same split — utterance
+        //     indices stay aligned.
+        //  2. The live line's translation input is cut at the final
+        //     boundary: feeding the volatile hypothesis re-translated the
+        //     whole sentence on every recognizer flicker (a caption line
+        //     was observed rewriting itself dozens of times). The volatile
+        //     tail simply waits — it becomes final within a beat or two.
+        // Sentence-per-utterance is fine HERE: Apple translates without
+        // cross-utterance context, and only complete sentences promote.
+        if appleTranslator != nil {
+            // Sealed lines get the SAME sentence split as promoted ones, so
+            // the utterance list derives identically before and after the
+            // real seal arrives — otherwise indices shear at seal time.
+            lines = lines.flatMap { line -> [String] in
+                let (done, remainder) = SpeechGate.splitSentences(line)
+                let rest = remainder.trimmingCharacters(in: .whitespaces)
+                return done + (rest.isEmpty ? [] : [rest])
+            }
+            if let live = liveSource {
+                let liveStart = text.count - live.count
+                let stableInLive = max(0, min(live.count, stableLength - liveStart))
+                let stablePart = String(live.prefix(stableInLive))
+                let (done, remainder) = SpeechGate.splitSentences(stablePart)
+                lines.append(contentsOf: done)
+                let rest = remainder.trimmingCharacters(in: .whitespaces)
+                liveSource = rest.isEmpty ? nil : rest
+            }
+        }
 
         // Sealed lines, by index. When a line's source changed:
         //  - it grew (the live line's last words arrived as it sealed): the
