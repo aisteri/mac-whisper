@@ -43,8 +43,9 @@ final class SpeechGate {
     /// by a conclusion. Also read as: the leading run of the unstable
     /// region that is already out of the speakers.
     private var earlyBalance = 0
-    /// Early-speak timestamps not yet claimed, for the conclude-lag metric.
-    private var earlyMarks: [Date] = []
+    /// Early-spoken sizes and times not yet claimed, for the conclude-lag
+    /// metric (consumed proportionally as the balance drains).
+    private var earlyMarks: [(scalars: Int, at: Date)] = []
     /// Content backstop under the ledger: recently spoken text, normalized
     /// and concatenated. Catches a conclusion that outgrew its balance in
     /// rewrite, and dead-session leftovers after a reconnect reset the
@@ -60,12 +61,15 @@ final class SpeechGate {
     /// exactly when the tentative text is most settled and most overdue.
     private var fireTimer: DispatchWorkItem?
 
-    /// Stability windows: a sentence with text already following it has its
-    /// ending locked in and firms up fast; the LAST sentence of the
-    /// tentative is where DeepL's conclusion rewrites endings, so it must
-    /// prove itself longer.
+    /// How long a followed sentence must stay unchanged before speaking.
+    /// Only sentences with text already flowing AFTER them qualify at all:
+    /// Korean is verb-final, so DeepL puts a provisional ending ("~입니다.")
+    /// on sentences still being spoken — a "complete-looking" sentence at
+    /// the very end of the tentative is routinely half of the real one
+    /// (measured: every truncated-speech incident came from there). The
+    /// start of the NEXT sentence is the only trustworthy completion
+    /// signal; the last sentence always waits for its conclusion.
     private let stabilityFollowed: TimeInterval = 0.6
-    private let stabilityAtEnd: TimeInterval = 1.2
 
     // MARK: - Lifecycle
 
@@ -120,11 +124,7 @@ final class SpeechGate {
             let size = Self.normalize(sentence).unicodeScalars.count
             if earlyBalance > 0, earlyBalance * 2 >= size {
                 earlyBalance = max(0, earlyBalance - size)
-                if earlyBalance == 0 { earlyMarks.removeAll() }
-                else if !earlyMarks.isEmpty {
-                    let ms = Int(Date().timeIntervalSince(earlyMarks.removeFirst()) * 1000)
-                    SpeechService.diag("gate conclude-lag=\(ms)ms")
-                }
+                consumeMarks(scalars: size)
                 SpeechService.diag("gate skip(ledger) \"\(sentence.prefix(40))\"")
             } else if wasRecentlySpoken(sentence) {
                 SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
@@ -137,6 +137,24 @@ final class SpeechGate {
             SpeechService.diag("gate speak(concluded) \"\(toSpeak.prefix(60))\"")
             speak?(toSpeak)
         }
+    }
+
+    /// Drains early-speak marks in proportion to the claimed scalars and
+    /// logs each fully claimed mark's age — how far ahead of its conclusion
+    /// that early speech ran.
+    private func consumeMarks(scalars: Int) {
+        var remaining = scalars
+        while remaining > 0, !earlyMarks.isEmpty {
+            if earlyMarks[0].scalars > remaining {
+                earlyMarks[0].scalars -= remaining
+                return
+            }
+            remaining -= earlyMarks[0].scalars
+            let mark = earlyMarks.removeFirst()
+            let ms = Int(Date().timeIntervalSince(mark.at) * 1000)
+            SpeechService.diag("gate conclude-lag=\(ms)ms")
+        }
+        if earlyBalance == 0 { earlyMarks.removeAll() }
     }
 
     /// Content backstop: the sentence's normalized form appears within
@@ -159,11 +177,15 @@ final class SpeechGate {
 
     /// The unstable region is the concluded-but-unfinished tail plus the
     /// whole tentative. Its leading `earlyBalance` scalars are already
-    /// spoken (order preservation again); the complete sentences after that
-    /// form the candidate, which speaks once it has stayed unchanged long
-    /// enough.
+    /// spoken (order preservation again); the complete sentences after
+    /// that — EXCEPT the region's final sentence, which only looks complete
+    /// (see stabilityFollowed) — form the candidate, which speaks once it
+    /// has stayed unchanged long enough.
     private func considerUnstable(_ tentative: String) {
-        let (sentences, remainder) = Self.splitSentences(assembling + tentative)
+        var (sentences, remainder) = Self.splitSentences(assembling + tentative)
+        if remainder.trimmingCharacters(in: .whitespaces).isEmpty, !sentences.isEmpty {
+            sentences.removeLast() // no next sentence started: not trusted yet
+        }
         var covered = 0
         var unspoken: [String] = []
         for sentence in sentences {
@@ -179,16 +201,12 @@ final class SpeechGate {
             clearCandidate()
             return
         }
-        // A candidate with text already flowing after it has its ending
-        // pinned down; one sitting at the very end is still being reworded.
-        let window = remainder.trimmingCharacters(in: .whitespaces).isEmpty
-            ? stabilityAtEnd : stabilityFollowed
         if newCandidate != candidate {
             clearCandidate()
             candidate = newCandidate
             candidateSince = Date()
         }
-        let deadline = candidateSince.addingTimeInterval(window)
+        let deadline = candidateSince.addingTimeInterval(stabilityFollowed)
         if Date() >= deadline {
             fire()
         } else if fireTimer == nil || deadline != candidateDeadline {
@@ -212,8 +230,9 @@ final class SpeechGate {
     private func fire() {
         let stableMs = Int(Date().timeIntervalSince(candidateSince) * 1000)
         for sentence in Self.splitSentences(candidate).sentences {
-            earlyBalance += Self.normalize(sentence).unicodeScalars.count
-            earlyMarks.append(Date())
+            let size = Self.normalize(sentence).unicodeScalars.count
+            earlyBalance += size
+            earlyMarks.append((scalars: size, at: Date()))
             rememberSpoken(sentence)
         }
         SpeechService.diag("gate speak(early) stable=\(stableMs)ms \"\(candidate.prefix(60))\"")
