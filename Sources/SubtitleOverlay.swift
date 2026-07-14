@@ -408,7 +408,10 @@ final class SubtitleOverlay {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let vis = screen.visibleFrame
         let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        let textHeight = lineHeight * 3 + 4
+        // Four lines: two settled (anchored) plus room for the grey tail —
+        // sized once; overflowing grey clips at the bottom instead of
+        // squeezing extra lines into the box.
+        let textHeight = lineHeight * 4 + 4
         let boxWidth = textWidth + hPadding * 2
         let boxHeight = textHeight + vPadding * 2
         var frame = NSRect(x: vis.midX - boxWidth / 2, y: vis.minY + bottomMargin,

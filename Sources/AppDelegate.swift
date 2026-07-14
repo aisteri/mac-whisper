@@ -29,8 +29,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Latest full transcripts (base + current session), for save/display.
     private var voiceSourceFull = ""
     private var voiceTargetFull = ""
-    /// What the gate has actually sent to the voice — the caption source in
-    /// gate-driven modes, so screen and speech always agree.
+    /// Everything the gate has SETTLED (handed to the voice queue), in
+    /// order — the caption's white stream. Text turns white the moment it
+    /// settles, not when playback reaches it: the gap between those two
+    /// events left settled text invisible ("captions skipped ahead").
+    /// Append-only; renderGateCaption asserts that invariant.
+    private var settledStream = ""
+    /// The playback-finished part of the settled stream (playhead base).
     private var voiceSpokenCaption = ""
     /// The utterance the speakers are on right now, and the play head's
     /// character position within it (karaoke highlight).
@@ -344,10 +349,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speechGate.speak = { [weak self] text in
             guard let self else { return }
             self.speechOutput.enqueue(text)
-            // With TTS off there is no playback to key the captions to —
-            // show the settled text as soon as the gate clears it.
-            if !self.speechOutput.enabled {
-                self.appendVoiceCaption(text)
+            // White the moment it settles — playback only moves the yellow
+            // boundary later.
+            if self.gateDrivesCaptions {
+                self.settledStream += self.settledStream.isEmpty ? text : " " + text
+                if self.settledStream.count > 4000 {
+                    self.settledStream = String(self.settledStream.suffix(2000))
+                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(2000))
+                }
+                self.renderGateCaption()
             }
         }
         // DeepL streaming mode: the caption IS the spoken stream, keyed to
@@ -584,6 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             speechGate.earlySpeech = settings.earlySpeechEnabled
                 && !settings.appleTranslationEnabled
             voiceSpokenCaption = ""
+            settledStream = ""; lastSettledCount = 0
             speakingText = ""; speakingUpTo = 0; pendingGray = ""
             // The gate drives speech AND captions for the stream-shaped
             // providers (DeepL Voice, Apple); the LLM path keeps the legacy
@@ -937,29 +948,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Appends spoken (or gate-settled, when TTS is off) text to the
-    /// streaming-mode caption and redraws it.
-    private func appendVoiceCaption(_ text: String) {
-        guard gateDrivesCaptions else { return }
-        voiceSpokenCaption += voiceSpokenCaption.isEmpty ? text : " " + text
-        if voiceSpokenCaption.count > 2000 {
-            voiceSpokenCaption = String(voiceSpokenCaption.suffix(1000))
-        }
-        renderGateCaption()
-    }
-
     /// Karaoke caption: ONE continuous stream — yellow (heard) → white
     /// (settled, queued for the voice) → grey (still transcribing) — with
     /// both boundaries only ever moving right. The gate owns the
     /// settled/grey boundary, so the same words can never render twice.
+    private var lastSettledCount = 0
+
     private func renderGateCaption() {
         guard gateDrivesCaptions else { return }
-        let settled = [voiceSpokenCaption, speakingText]
-            .filter { !$0.isEmpty }.joined(separator: " ")
-        let played = voiceSpokenCaption.isEmpty
-            ? speakingUpTo
-            : voiceSpokenCaption.count + (speakingText.isEmpty ? 0 : 1 + speakingUpTo)
-        subtitles.updateKaraoke(settled: settled, playedChars: played, grey: pendingGray)
+        // Invariant: the white stream only ever grows. A shrink means a
+        // caption-state bug of the "text vanished" family — log it loudly.
+        if settledStream.count < lastSettledCount, settledStream.count > 0 {
+            SpeechService.diag("caption INVARIANT VIOLATED: settled shrank \(lastSettledCount) -> \(settledStream.count)")
+        }
+        lastSettledCount = settledStream.count
+        // Playhead: finished utterances plus the current one's progress,
+        // clamped — its coordinates track the enqueue stream, which can
+        // differ from settledStream by a few join spaces.
+        let played = voiceSpokenCaption.count
+            + (speakingText.isEmpty ? 0 : 1 + speakingUpTo)
+        subtitles.updateKaraoke(settled: settledStream,
+                                playedChars: min(played, settledStream.count),
+                                grey: pendingGray)
     }
 
     private func handleVoiceError(_ message: String, from session: DeepLVoiceSession) {
