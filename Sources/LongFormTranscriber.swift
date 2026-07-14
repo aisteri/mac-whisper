@@ -281,10 +281,16 @@ final class LongFormTranscriber {
     private var lastBufferAt = Date.distantFuture
     private var captureWatchdogTimer: Timer?
     private var captureRestartInFlight = false
-    /// 3 s: even silence delivers level-0 buffers, so any real gap means
-    /// the stream is dead — and every second here is lost interpretation
-    /// audio (the restart itself adds ~1 s).
-    private let captureStallTimeout: TimeInterval = 3
+    /// Base stall timeout. A gap USUALLY means the stream died — but some
+    /// meeting apps stop producing audio entirely while the far side is
+    /// silent, and then no amount of restarting brings buffers back (a
+    /// measured session hit a restart every 3-5 s, each one punching a
+    /// hole in the audio and shredding the local recognizer). So the
+    /// timeout backs off exponentially while restarts don't recover any
+    /// buffers, and snaps back to the base the moment audio returns.
+    private let captureStallTimeout: TimeInterval = 5
+    private var captureStallBackoff: TimeInterval = 5
+    private var lastCaptureRestartAt = Date.distantPast
 
     private func startCaptureWatchdog() {
         captureWatchdogTimer?.invalidate()
@@ -300,8 +306,12 @@ final class LongFormTranscriber {
         let last = lastBufferAt
         let running = isRunning
         stateLock.unlock()
+        // Buffers arrived since the last restart: the stream is (or was)
+        // alive — restarting helps again, so drop back to the base timeout.
+        if last > lastCaptureRestartAt { captureStallBackoff = captureStallTimeout }
         guard running, !captureRestartInFlight, last != .distantFuture,
-              Date().timeIntervalSince(last) > captureStallTimeout else { return }
+              Date().timeIntervalSince(max(last, lastCaptureRestartAt)) > captureStallBackoff
+        else { return }
         guard audioSource == .systemAudio else {
             // A dead mic engine has not been observed; log so it becomes
             // diagnosable if it ever is.
@@ -309,8 +319,15 @@ final class LongFormTranscriber {
             stateLock.lock(); lastBufferAt = Date(); stateLock.unlock()
             return
         }
+        if last <= lastCaptureRestartAt {
+            // The previous restart recovered nothing — the SOURCE is
+            // silent, not the stream dead. Back off instead of punching
+            // 1-2 s holes into the audio every few seconds.
+            captureStallBackoff = min(captureStallBackoff * 2, 40)
+        }
+        lastCaptureRestartAt = Date()
         captureRestartInFlight = true
-        SpeechService.diag("capture watchdog: no buffers for \(Int(captureStallTimeout))s — restarting system capture")
+        SpeechService.diag("capture watchdog: no buffers for \(Int(captureStallBackoff))s — restarting system capture")
         stateLock.lock()
         let stream = scStream
         scStream = nil
@@ -332,7 +349,9 @@ final class LongFormTranscriber {
                 }
             }
             self.stateLock.lock()
-            self.lastBufferAt = Date() // re-arm; don't refire instantly
+            // NOT lastBufferAt: that would fake "buffers recovered" and
+            // reset the backoff. The alive-check clocks from this instead.
+            self.lastCaptureRestartAt = Date()
             self.captureRestartInFlight = false
             self.stateLock.unlock()
         }
