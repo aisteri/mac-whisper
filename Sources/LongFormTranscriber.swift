@@ -99,6 +99,10 @@ final class LongFormTranscriber {
     /// were cut at arbitrary points, splitting words across translations.
     private let volatileStableFinalizeAfter: TimeInterval = 2.0
     private let minFinalizeSpacing: TimeInterval = 1.5
+    /// Past this without a finalize, any ink-dry lull commits (see the
+    /// cadence note in trackVoiceActivity) — continuous speech must not
+    /// starve finalization.
+    private let cadenceFinalizeAfter: TimeInterval = 4.0
 
     private func trackVoiceActivity(_ level: Float) {
         // ~20 ms per buffer; 0.995^n halves the envelope in roughly 3 s.
@@ -139,12 +143,27 @@ final class LongFormTranscriber {
         // Stale-hypothesis finalize: the recognizer hasn't revised its
         // volatile text for a while, so committing it loses nothing — this
         // covers sources whose background music defeats the level VAD.
+        //
+        // CADENCE: silence and a 2 s-stale hypothesis were the ONLY
+        // finalize triggers, and a speaker who never pauses (any meeting)
+        // hits neither — finalization froze for 20-30 s and then a whole
+        // paragraph settled at once ("stuck, then whooshes past"; the same
+        // mechanism made a ~26 s cold start). Past `cadenceFinalizeAfter`
+        // without a finalize, committing during ANY brief lull (ink-dry,
+        // 0.3 s) beats waiting for a full stability window — same nature
+        // as the stale trigger, just impatient.
         guard now.timeIntervalSince(lastFinalizeAt) >= minFinalizeSpacing else { return }
+        let sinceFinalize = now.timeIntervalSince(lastFinalizeAt)
+        let requiredLull = sinceFinalize >= cadenceFinalizeAfter
+            ? volatileInkDry : volatileStableFinalizeAfter
         stateLock.lock()
-        let volatileStable = !volatileText.isEmpty
-            && now.timeIntervalSince(volatileChangedAt) >= volatileStableFinalizeAfter
+        let lull = now.timeIntervalSince(volatileChangedAt)
+        let volatileStable = !volatileText.isEmpty && lull >= requiredLull
         stateLock.unlock()
         if volatileStable {
+            if requiredLull == volatileInkDry {
+                SpeechService.diag(String(format: "longform cadence finalize +%.1fs since last", sinceFinalize))
+            }
             lastFinalizeAt = now
             requestFinalize()
         }
