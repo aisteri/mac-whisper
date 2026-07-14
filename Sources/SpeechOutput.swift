@@ -57,10 +57,10 @@ final class SpeechOutput {
     /// characters: rendering runs ~50× realtime, so text is scheduled almost
     /// the moment it arrives and the queue lives in the player, not here.
     private let baseRateMultiplier: Double = 1.1
-    private let maxRateMultiplier: Double = 1.25
+    private let maxRateMultiplier: Double = 1.35
     /// Pending playback (seconds) where the rate starts climbing / tops out.
-    private let rateRampStart: Double = 2.0
-    private let rateRampEnd: Double = 12.0
+    private let rateRampStart: Double = 1.0
+    private let rateRampEnd: Double = 8.0
 
     /// How long an idle voice waits for more shards before speaking an
     /// unterminated fragment. A slow speaker produces small shards with real
@@ -205,11 +205,13 @@ final class SpeechOutput {
     }
 
     /// Renders a token utterance and discards it, so a premium voice's model
-    /// load (hundreds of ms to seconds on first synthesis) is paid at session
-    /// start instead of delaying the first real translation.
+    /// load is paid at session start instead of delaying the first real
+    /// translation. A real sentence, not a blank: rendering " " left the
+    /// premium model cold and the first sentence still took ~750 ms to
+    /// start (measured).
     func prewarm() {
         guard enabled else { return }
-        let utterance = AVSpeechUtterance(string: " ")
+        let utterance = AVSpeechUtterance(string: "통역 준비가 완료되었습니다.")
         utterance.voice = resolveVoice()
         synthesizer.write(utterance) { _ in }
     }

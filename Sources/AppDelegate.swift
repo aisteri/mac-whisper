@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Latest full transcripts (base + current session), for save/display.
     private var voiceSourceFull = ""
     private var voiceTargetFull = ""
+    /// What the gate has actually sent to the voice — the caption source in
+    /// streaming mode, so screen and speech always agree.
+    private var voiceSpokenCaption = ""
     private var voiceRestarts = 0
 
     /// What a locked session is for: a meeting capture (transcript + optional
@@ -324,7 +327,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.speechOutput.enqueue(text)
         }
         speechGate.speak = { [weak self] text in
-            self?.speechOutput.enqueue(text)
+            guard let self else { return }
+            self.speechOutput.enqueue(text)
+            // DeepL streaming mode: the caption IS the spoken stream —
+            // screen and voice always agree, and settled text appears
+            // ahead of DeepL's conclusion instead of flickering grey.
+            if self.longForm.bypassAnalyzer {
+                self.voiceSpokenCaption += self.voiceSpokenCaption.isEmpty ? text : " " + text
+                if self.voiceSpokenCaption.count > 2000 {
+                    self.voiceSpokenCaption = String(self.voiceSpokenCaption.suffix(1000))
+                }
+                self.subtitles.update(pieces: Self.voiceCaptionPieces(
+                    concluded: self.voiceSpokenCaption, tentative: ""))
+            }
         }
         longForm.onFinished = { [weak self] text in self?.handleLockedFinished(text) }
         longForm.onStatus = { [weak self] status in
@@ -521,6 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // problems apply.
                 voiceSourceBase = ""; voiceTargetBase = ""
                 voiceSourceFull = ""; voiceTargetFull = ""
+                voiceSpokenCaption = ""
                 voiceRestarts = 0
                 speechGate.reset()
                 speechGate.earlySpeech = settings.earlySpeechEnabled
@@ -783,12 +799,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.voiceRestarts = 0
             self.voiceTargetFull = self.voiceTargetBase + concluded
             self.transcriptWindow.updateTranscript(self.voiceTargetFull + tentative)
-            self.subtitles.update(pieces: Self.voiceCaptionPieces(
-                concluded: self.voiceTargetFull, tentative: tentative))
+            // The captions are NOT drawn here: they follow the gate's speak
+            // stream (below), so the screen shows exactly what the voice
+            // says — no flickering provisional text that a conclusion will
+            // rewrite anyway.
             // The gate decides what is settled enough to speak — concluded
-            // text always, plus stable tentative sentences ahead of their
-            // conclusion. The concluded stream survives reconnects via the
-            // base, so its char counts never go stale.
+            // text always, plus stable tentative sentences/clauses ahead of
+            // their conclusion. The concluded stream survives reconnects
+            // via the base, so its char counts never go stale.
             self.speechGate.update(concludedStream: self.voiceTargetFull, tentative: tentative)
         }
         session.onError = { [weak self] message in

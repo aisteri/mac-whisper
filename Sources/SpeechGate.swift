@@ -69,7 +69,11 @@ final class SpeechGate {
     /// (measured: every truncated-speech incident came from there). The
     /// start of the NEXT sentence is the only trustworthy completion
     /// signal; the last sentence always waits for its conclusion.
-    private let stabilityFollowed: TimeInterval = 0.6
+    /// 0.3 s, not longer: the next sentence starting is itself the strong
+    /// signal; the incidents we saw (conclusion-time restructuring) happen
+    /// regardless of how long the sentence sat stable, so extra waiting
+    /// bought no accuracy — only lag.
+    private let stabilityFollowed: TimeInterval = 0.3
 
     // MARK: - Lifecycle
 
@@ -120,14 +124,28 @@ final class SpeechGate {
         guard !sentences.isEmpty else { return }
         assembling = remainder
         var toSpeak = ""
-        for sentence in sentences {
+        // Settlement works clause by clause, matching the speaking side:
+        // early speech may have covered only the leading clauses of a
+        // sentence, and settling whole sentences against that partial
+        // balance would swallow the unspoken tail clauses.
+        for sentence in sentences.flatMap(Self.splitClauses) {
             let size = Self.normalize(sentence).unicodeScalars.count
-            if earlyBalance > 0, earlyBalance * 2 >= size {
+            if wasRecentlySpoken(sentence) {
+                // Direct evidence: this text was spoken verbatim (modulo
+                // spacing/punctuation). Settle its ledger share too.
+                if earlyBalance > 0 {
+                    earlyBalance = max(0, earlyBalance - size)
+                    consumeMarks(scalars: size)
+                }
+                SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
+            } else if earlyBalance > 0, earlyBalance * 5 >= size * 4 {
+                // Full coverage within ending-rewrite tolerance (~±20%,
+                // the measured size drift of conclusion rewrites). NOT
+                // half-coverage: a partially spoken piece must fall through
+                // and SPEAK — duplication over information loss.
                 earlyBalance = max(0, earlyBalance - size)
                 consumeMarks(scalars: size)
                 SpeechService.diag("gate skip(ledger) \"\(sentence.prefix(40))\"")
-            } else if wasRecentlySpoken(sentence) {
-                SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
             } else {
                 // Speaking against an outstanding balance means this
                 // conclusion outgrew its early-spoken sentence (merged with
@@ -197,18 +215,27 @@ final class SpeechGate {
     /// (see stabilityFollowed) — form the candidate, which speaks once it
     /// has stayed unchanged long enough.
     private func considerUnstable(_ tentative: String) {
-        var (sentences, remainder) = Self.splitSentences(assembling + tentative)
-        if remainder.trimmingCharacters(in: .whitespaces).isEmpty, !sentences.isEmpty {
-            sentences.removeLast() // no next sentence started: not trusted yet
+        var (pieces, tail) = Self.splitSentences(assembling + tentative)
+        if tail.trimmingCharacters(in: .whitespaces).isEmpty {
+            if !pieces.isEmpty { pieces.removeLast() } // no next sentence started: not trusted yet
+        } else {
+            // Salami technique: a long sentence still being formed need not
+            // be waited out whole — its clauses up to the last comma with
+            // text already flowing AFTER it are as pinned down as a
+            // followed sentence, so they speak now. Awkward clause-by-
+            // clause delivery traded for keeping pace (user's call); the
+            // ledger reconciles the conclusion by size, so no dedup worry.
+            let clause = Self.clauseBoundedPrefix(of: tail)
+            if !clause.isEmpty { pieces.append(clause) }
         }
         var covered = 0
         var unspoken: [String] = []
-        for sentence in sentences {
-            let size = Self.normalize(sentence).unicodeScalars.count
+        for piece in pieces {
+            let size = Self.normalize(piece).unicodeScalars.count
             if covered + size / 2 <= earlyBalance {
                 covered += size // ledger says this one is already out
             } else {
-                unspoken.append(sentence)
+                unspoken.append(piece)
             }
         }
         let newCandidate = unspoken.joined(separator: " ")
@@ -244,11 +271,16 @@ final class SpeechGate {
 
     private func fire() {
         let stableMs = Int(Date().timeIntervalSince(candidateSince) * 1000)
-        for sentence in Self.splitSentences(candidate).sentences {
-            let size = Self.normalize(sentence).unicodeScalars.count
+        // Post the whole candidate to the ledger: it may end in a clause
+        // fragment rather than a sentence, and the ledger only counts size.
+        var (posted, clauseTail) = Self.splitSentences(candidate)
+        let tail = clauseTail.trimmingCharacters(in: .whitespaces)
+        if !tail.isEmpty { posted.append(tail) }
+        for piece in posted {
+            let size = Self.normalize(piece).unicodeScalars.count
             earlyBalance += size
             earlyMarks.append((scalars: size, at: Date()))
-            rememberSpoken(sentence)
+            rememberSpoken(piece)
         }
         SpeechService.diag("gate speak(early) stable=\(stableMs)ms \"\(candidate.prefix(60))\"")
         let text = candidate
@@ -299,6 +331,60 @@ final class SpeechGate {
             }
         }
         return (sentences, String(text[start...]))
+    }
+
+    /// Splits a sentence at its clause boundaries (comma family; a comma
+    /// directly followed by a digit — "1,000" — doesn't count). The last
+    /// piece carries the sentence ending. Used on the settlement side so
+    /// its units match the clause-level early speech.
+    static func splitClauses(_ sentence: String) -> [String] {
+        let boundaries: Set<Character> = [",", "、", "，", ";", "；"]
+        var clauses: [String] = []
+        var start = sentence.startIndex
+        var i = sentence.startIndex
+        while i < sentence.endIndex {
+            if boundaries.contains(sentence[i]) {
+                let next = sentence.index(after: i)
+                if next == sentence.endIndex || !sentence[next].isNumber {
+                    let piece = String(sentence[start..<next])
+                        .trimmingCharacters(in: .whitespaces)
+                    if !piece.isEmpty { clauses.append(piece) }
+                    start = next
+                }
+            }
+            i = sentence.index(after: i)
+        }
+        let last = String(sentence[start...]).trimmingCharacters(in: .whitespaces)
+        if !last.isEmpty { clauses.append(last) }
+        return clauses
+    }
+
+    /// The prefix of an unfinished sentence up to its LAST clause boundary
+    /// (comma family) that already has text flowing after it — the clause
+    /// version of the followed-sentence rule. Empty when no boundary
+    /// qualifies or the prefix is too short to be worth voicing alone.
+    /// A comma directly followed by a digit ("1,000") is not a boundary.
+    static func clauseBoundedPrefix(of text: String) -> String {
+        let boundaries: Set<Character> = [",", "、", "，", ";", "；"]
+        var cut: String.Index?
+        var i = text.startIndex
+        while i < text.endIndex {
+            let ch = text[i]
+            if boundaries.contains(ch) {
+                let next = text.index(after: i)
+                // Needs BOTH: not a numeric comma, and following text — a
+                // trailing comma may still be rewritten with the clause.
+                if next < text.endIndex, !text[next].isNumber,
+                   !text[next...].trimmingCharacters(in: .whitespaces).isEmpty {
+                    cut = next
+                }
+            }
+            i = text.index(after: i)
+        }
+        guard let cut else { return "" }
+        let prefix = String(text[..<cut])
+        guard normalize(prefix).unicodeScalars.count >= 8 else { return "" }
+        return prefix
     }
 
     /// Letters and digits only, canonically decomposed — spacing and
