@@ -1,4 +1,5 @@
 import Cocoa
+import CoreText
 
 /// Video-caption-style overlay for locked (long-form) recordings: white text on
 /// a dim black backdrop, pinned to the very bottom of the screen — lower than
@@ -142,6 +143,8 @@ final class SubtitleOverlay {
         armed = false
         idleTimer?.invalidate()
         idleTimer = nil
+        karaokeCache = nil
+        karaokeFrameSet = false // re-measure next session (screen may change)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
             panel.animator().alphaValue = 0
@@ -291,6 +294,139 @@ final class SubtitleOverlay {
         textField.attributedStringValue = styled
         layout(for: styled.string)
         reveal()
+    }
+
+    // MARK: - Karaoke captions (gate-driven interpreter modes)
+    //
+    // Caption principles, learned the hard way (native listeners reported
+    // the captions were UNREADABLE while text kept re-centering):
+    //  1. A drawn glyph never moves. The only allowed motion is a whole-line
+    //     scroll when a new line fills up.
+    //  2. Text grows at the end only (the spoken stream is append-only).
+    //  3. Layers never pop in/out; the box never resizes. Fixed width,
+    //     fixed height, fixed position, LEFT-aligned text.
+    //  4. Color changes happen in place (karaoke highlight, dimmed preview).
+
+    /// Cached line-break offsets (UTF-16) for the current stream + width.
+    private var karaokeCache: (text: String, width: CGFloat, starts: [Int])?
+    private var karaokeFrameSet = false
+
+    /// Renders the spoken stream's last two wrapped lines (white; the
+    /// currently-heard utterance highlighted up to the play head) plus one
+    /// dimmed preview line of the newest unstable translation.
+    func updateKaraoke(spoken: String, speaking: String, speakingUpTo: Int, preview: String) {
+        guard armed else { return }
+        let stream = [spoken, speaking].filter { !$0.isEmpty }.joined(separator: " ")
+        guard stream.contains(where: { $0.isLetter || $0.isNumber })
+                || preview.contains(where: { $0.isLetter || $0.isNumber }) else { return }
+
+        let textWidth = karaokeTextWidth()
+        let ns = stream as NSString
+        let starts = karaokeLineStarts(stream, width: textWidth)
+        let visibleStart = starts.count >= 2 ? starts[starts.count - 2] : 0
+
+        // Highlight range in UTF-16, global to the stream.
+        let speakLenU = (speaking as NSString).length
+        let speakStartU = ns.length - speakLenU
+        var upToU = speakStartU
+        if !speaking.isEmpty {
+            let cut = min(speakingUpTo, speaking.count)
+            let idx = speaking.index(speaking.startIndex, offsetBy: cut)
+            upToU = speakStartU + speaking.utf16.distance(from: speaking.utf16.startIndex,
+                                                          to: idx.samePosition(in: speaking.utf16)!)
+        }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        let base: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: paragraph]
+        func run(_ range: NSRange, _ color: NSColor) -> NSAttributedString {
+            NSAttributedString(string: ns.substring(with: range),
+                               attributes: base.merging([.foregroundColor: color]) { a, _ in a })
+        }
+        let styled = NSMutableAttributedString()
+        let spokenEnd = max(visibleStart, min(speakStartU, ns.length))
+        if spokenEnd > visibleStart {
+            styled.append(run(NSRange(location: visibleStart, length: spokenEnd - visibleStart), .white))
+        }
+        if speakLenU > 0 {
+            let hlStart = max(visibleStart, speakStartU)
+            if upToU > hlStart {
+                styled.append(run(NSRange(location: hlStart, length: upToU - hlStart), .systemYellow))
+            }
+            if ns.length > max(hlStart, upToU) {
+                let from = max(hlStart, upToU)
+                styled.append(run(NSRange(location: from, length: ns.length - from),
+                                  NSColor.white.withAlphaComponent(0.75)))
+            }
+        }
+        // Preview: one line only, its newest tail, dimmed. Rewrites are
+        // confined to this bottom slot by design.
+        if !preview.isEmpty {
+            let pStarts = karaokeLineStarts(preview, width: textWidth, cache: false)
+            let pNS = preview as NSString
+            let lastLine = pNS.substring(from: pStarts.last ?? 0)
+            styled.append(NSAttributedString(string: (styled.length > 0 ? "\n" : "") + lastLine,
+                                             attributes: base.merging(
+                                                [.foregroundColor: NSColor.white.withAlphaComponent(0.5)]) { a, _ in a }))
+        }
+
+        let key = styled.string
+        if key == lastContent {
+            guard Int(upToU) != lastHighlight else { return }
+            lastHighlight = Int(upToU)
+            textField.attributedStringValue = styled
+            return
+        }
+        lastContent = key
+        lastHighlight = Int(upToU)
+        lastContentAt = Date()
+        flashGen &+= 1
+        textField.attributedStringValue = styled
+        layoutKaraokeIfNeeded(textWidth: textWidth)
+        reveal()
+    }
+
+    private func karaokeTextWidth() -> CGFloat {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return 800 }
+        return min(screen.visibleFrame.width * 0.72, 1000) - hPadding * 2
+    }
+
+    /// UTF-16 offsets where each wrapped line begins, for a fixed width.
+    private func karaokeLineStarts(_ text: String, width: CGFloat, cache: Bool = true) -> [Int] {
+        if cache, let c = karaokeCache, c.text == text, c.width == width { return c.starts }
+        let attr = NSAttributedString(string: text, attributes: [.font: font])
+        let typesetter = CTTypesetterCreateWithAttributedString(attr)
+        var starts: [Int] = []
+        var idx = 0
+        while idx < attr.length {
+            starts.append(idx)
+            idx += max(1, CTTypesetterSuggestLineBreak(typesetter, idx, Double(width)))
+        }
+        if starts.isEmpty { starts = [0] }
+        if cache { karaokeCache = (text, width, starts) }
+        return starts
+    }
+
+    /// Fixed karaoke geometry: full width, three lines tall, bottom-center —
+    /// set once per session/screen, never resized by content.
+    private func layoutKaraokeIfNeeded(textWidth: CGFloat) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let vis = screen.visibleFrame
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        let textHeight = lineHeight * 3 + 4
+        let boxWidth = textWidth + hPadding * 2
+        let boxHeight = textHeight + vPadding * 2
+        var frame = NSRect(x: vis.midX - boxWidth / 2, y: vis.minY + bottomMargin,
+                           width: boxWidth + overhang, height: boxHeight + overhang)
+        if karaokeFrameSet, panel.frame == frame { return }
+        karaokeFrameSet = true
+        captionBox.frame = NSRect(x: 0, y: 0, width: boxWidth, height: boxHeight)
+        textField.frame = NSRect(x: hPadding, y: vPadding, width: textWidth, height: textHeight)
+        closeButton.frame = NSRect(x: boxWidth - closeSize / 2, y: boxHeight - closeSize / 2,
+                                   width: closeSize, height: closeSize)
+        panel.setFrame(frame, display: true)
+        container.needsDisplay = true
     }
 
     /// Feeds the full accumulated transcript; the overlay shows only the tail,

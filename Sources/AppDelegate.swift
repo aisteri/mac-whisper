@@ -572,13 +572,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
             }
             speechGate.reset()
-            // Early speech suits DeepL only: its tentative is the SAME
-            // pipeline's earlier draft. The Apple path re-translates a
-            // moving transcript hypothesis, so its live line rewrites
-            // wholesale — early-speaking it produced triple readings
-            // (measured). Apple speaks concluded translations only.
+            // Early speech on for BOTH stream providers. The Apple path's
+            // rewrite storms once made this produce triple readings, but
+            // dedup now runs at three layers (source-level, order ledger,
+            // neighbor similarity) and the user chose speed-with-locked
+            // output over waiting for polished conclusions: once a clause
+            // is voiced it is FIXED — later rewrites are ignored.
             speechGate.earlySpeech = settings.earlySpeechEnabled
-                && !settings.appleTranslationEnabled
             voiceSpokenCaption = ""
             speakingText = ""; speakingUpTo = 0; pendingPreview = ""
             // The gate drives speech AND captions for the stream-shaped
@@ -934,31 +934,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderGateCaption()
     }
 
-    /// Karaoke caption: a spoken tail (white), the utterance being heard
-    /// right now (highlighted up to the play head), and the newest
-    /// still-unspoken translation as a dimmed preview line — so the eyes
-    /// never wait for the voice, and the voice's position is visible.
+    /// Karaoke caption: the spoken stream's last two wrapped lines (white,
+    /// with the heard-right-now utterance highlighted to the play head)
+    /// over one dimmed preview line — fixed geometry, left-aligned, so a
+    /// reader's eyes never lose their place (see SubtitleOverlay principles).
     private func renderGateCaption() {
         guard gateDrivesCaptions else { return }
-        var pieces: [(text: String, style: SubtitleOverlay.CaptionStyle)] = []
-        let (sentences, remainder) = SpeechGate.splitSentences(voiceSpokenCaption)
-        // A FIXED number of trailing sentences: varying it with the speaking
-        // state made earlier lines pop in and out at every utterance edge.
-        let spokenTail = (sentences.suffix(2) + [remainder])
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !spokenTail.isEmpty {
-            pieces.append((spokenTail, .spoken))
-        }
-        if !speakingText.isEmpty {
-            pieces.append(((spokenTail.isEmpty ? "" : "\n") + speakingText,
-                           .speaking(upTo: speakingUpTo + (spokenTail.isEmpty ? 0 : 1))))
-        }
-        if !pendingPreview.isEmpty, pieces.isEmpty || pendingPreview != speakingText {
-            pieces.append(((pieces.isEmpty ? "" : "\n") + pendingPreview, .pending))
-        }
-        guard !pieces.isEmpty else { return }
-        subtitles.update(styledPieces: pieces)
+        subtitles.updateKaraoke(spoken: voiceSpokenCaption, speaking: speakingText,
+                                speakingUpTo: speakingUpTo, preview: pendingPreview)
     }
 
     /// The dimmed preview line: the newest unstable translation's last
