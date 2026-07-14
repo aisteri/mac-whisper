@@ -515,6 +515,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Premium voices load their model on first synthesis; pay that
             // during session prep, not on the first translation.
             speechOutput.prewarm()
+            // Duck for the WHOLE session: per-sentence duck/unduck swung
+            // both the original and the voice (which rides the same system
+            // volume) up and down through every gap.
+            if settings.speakTranslations && settings.duckWhileSpeaking {
+                SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
+            }
             translator.appleTranslator = nil
             if settings.appleTranslationEnabled {
                 // On-device path: by construction NO network request is made
@@ -663,6 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         translator.teardown()
         appleTranslator.stop()
         speechOutput.endSession()
+        SystemAudio.unduckOutput() // session-scoped duck ends with the session
         // Streaming mode: the voice session owns the transcript (the local
         // recognizer never ran); stop it and save what it heard.
         var finalText = text

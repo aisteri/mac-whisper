@@ -57,6 +57,13 @@ final class SpeechGate {
     private var candidate = ""
     private var candidateSince = Date()
     private var candidateDeadline = Date()
+    /// Normalized form of the last early-spoken candidate. A new candidate
+    /// SIMILAR to it is a one-character-style rewrite of what was just
+    /// voiced (observed: "전환이"→"전환을" re-spoke a 116-char block) and
+    /// must not fire again; the conclusion will deliver whatever changed.
+    private var lastFiredNorm = ""
+    /// Throttles the stall diagnostic.
+    private var lastStallLogAt = Date.distantPast
     /// Fires the candidate when updates stop arriving — a speaker pausing is
     /// exactly when the tentative text is most settled and most overdue.
     private var fireTimer: DispatchWorkItem?
@@ -137,7 +144,7 @@ final class SpeechGate {
                     earlyBalance = max(0, earlyBalance - size)
                     consumeMarks(scalars: size)
                 }
-                SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
+                SpeechService.diag("gate skip(content) bal=\(earlyBalance) \"\(sentence.prefix(40))\"")
             } else if earlyBalance > 0, earlyBalance * 5 >= size * 4 {
                 // Full coverage within ending-rewrite tolerance (~±20%,
                 // the measured size drift of conclusion rewrites). NOT
@@ -145,7 +152,7 @@ final class SpeechGate {
                 // and SPEAK — duplication over information loss.
                 earlyBalance = max(0, earlyBalance - size)
                 consumeMarks(scalars: size)
-                SpeechService.diag("gate skip(ledger) \"\(sentence.prefix(40))\"")
+                SpeechService.diag("gate skip(ledger) bal=\(earlyBalance) \"\(sentence.prefix(40))\"")
             } else {
                 // Speaking against an outstanding balance means this
                 // conclusion outgrew its early-spoken sentence (merged with
@@ -167,7 +174,7 @@ final class SpeechGate {
             }
         }
         if !toSpeak.isEmpty {
-            SpeechService.diag("gate speak(concluded) \"\(toSpeak.prefix(60))\"")
+            SpeechService.diag("gate speak(concluded) bal=\(earlyBalance) \"\(toSpeak.prefix(60))\"")
             speak?(toSpeak)
         }
     }
@@ -246,7 +253,16 @@ final class SpeechGate {
             }
         }
         let newCandidate = unspoken.joined(separator: " ")
-        guard !newCandidate.isEmpty else {
+        let newNorm = Self.normalize(newCandidate)
+        // Too short to trust ahead of the conclusion ("물론 그." was a
+        // recognizer mid-word artifact), or a light rewrite of what was
+        // just voiced — either way the conclusion handles it.
+        guard newNorm.unicodeScalars.count >= 12,
+              !Self.similar(newNorm, lastFiredNorm) else {
+            if !newCandidate.isEmpty, Date().timeIntervalSince(lastStallLogAt) > 10 {
+                lastStallLogAt = Date()
+                SpeechService.diag("gate hold \"\(newCandidate.prefix(40))\"")
+            }
             clearCandidate()
             return
         }
@@ -289,7 +305,8 @@ final class SpeechGate {
             earlyMarks.append((scalars: size, at: Date()))
             rememberSpoken(piece)
         }
-        SpeechService.diag("gate speak(early) stable=\(stableMs)ms \"\(candidate.prefix(60))\"")
+        lastFiredNorm = Self.normalize(candidate)
+        SpeechService.diag("gate speak(early) stable=\(stableMs)ms bal=\(earlyBalance) \"\(candidate.prefix(60))\"")
         let text = candidate
         clearCandidate()
         speak?(text)
@@ -392,6 +409,20 @@ final class SpeechGate {
         let prefix = String(text[..<cut])
         guard normalize(prefix).unicodeScalars.count >= 8 else { return "" }
         return prefix
+    }
+
+    /// Whether two NORMALIZED strings are light rewrites of each other —
+    /// compared at the unicode-scalar (jamo) level, since Characters
+    /// recompose decomposed Hangul and hide the shared prefix.
+    static func similar(_ x: String, _ y: String) -> Bool {
+        if x == y { return true }
+        let a = Array(x.unicodeScalars)
+        let b = Array(y.unicodeScalars)
+        let minLen = min(a.count, b.count)
+        guard minLen > 0 else { return false }
+        if minLen >= 6, a.starts(with: b) || b.starts(with: a) { return true }
+        let common = zip(a, b).prefix(while: ==).count
+        return Double(common) >= Double(minLen) * 0.55 && max(a.count, b.count) <= minLen * 2
     }
 
     /// Letters and digits only, canonically decomposed — spacing and

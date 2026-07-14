@@ -50,7 +50,9 @@ final class SpeechOutput {
     /// no volume control) — there the boost is the only lever we have.
     /// 0.5, not lower: with the original inaudible the listener can't even
     /// tell someone is speaking — the duck should shape, not erase.
-    private let duckFactor: Float = 0.5
+    /// Applied for the WHOLE interpreter session by the app (not per
+    /// sentence — see scheduleIdleMarker's note).
+    static let duckFactor: Float = 0.5
     private let voiceBoost: Float = 2.4
 
     /// Base speech rate: 10% above the system default (user-tuned: default
@@ -115,10 +117,6 @@ final class SpeechOutput {
     private var utteranceStartedAt: Date?
     /// Invalidates in-flight render callbacks after a session reset.
     private var generation = 0
-    /// Pending un-duck, cancelled when the next utterance starts within the
-    /// grace period — without this the system volume pumps up and down in
-    /// every inter-utterance gap.
-    private var unduckWork: DispatchWorkItem?
 
     init() {
         engine.attach(player)
@@ -209,8 +207,6 @@ final class SpeechOutput {
         pendingPump?.cancel()
         pendingPump = nil
         player.stop()
-        cancelUnduck()
-        SystemAudio.unduckOutput()
     }
 
     /// Renders a token utterance and discards it, so a premium voice's model
@@ -254,11 +250,6 @@ final class SpeechOutput {
         SpeechService.diag(String(format: "tts pump chars=%d pending=%.1fs rate=%.2f wait=%dms",
                                   text.count, pending, multiplier, waitMs))
 
-        if duckOthers {
-            cancelUnduck()
-            SystemAudio.duckOutput(to: duckFactor)
-        }
-
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * Float(multiplier)
         utterance.voice = resolveVoice()
@@ -290,11 +281,7 @@ final class SpeechOutput {
     private func renderFinished(gen: Int) {
         guard gen == generation else { return }
         rendering = false
-        if buffer.isEmpty {
-            scheduleIdleMarker(gen: gen)
-        } else {
-            pump()
-        }
+        pump() // no-op when the buffer is empty
     }
 
     /// Seconds of audio scheduled but not yet played out.
@@ -422,50 +409,12 @@ final class SpeechOutput {
         scheduledFrames += Double(pcm.frameLength)
     }
 
-    /// Queues a marker behind all scheduled audio; when it plays out and
-    /// nothing new is rendering or waiting, the voice is truly idle — time
-    /// to restore the ducked system volume. (Playback completion no longer
-    /// drives the pump; renderFinished does.)
-    private func scheduleIdleMarker(gen: Int) {
-        guard gen == generation, let format = connectedFormat,
-              let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return }
-        marker.frameLength = 1
-        player.scheduleBuffer(marker) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self, gen == self.generation else { return }
-                // The queue may have grown BEHIND this marker (render runs
-                // far ahead of playback): un-ducking then would restore the
-                // original audio over a still-speaking voice. Only a truly
-                // drained pipeline counts as idle.
-                if !self.rendering, self.buffer.isEmpty,
-                   self.pendingPlaybackSeconds() < 0.1 {
-                    self.scheduleUnduck()
-                }
-            }
-        }
-    }
-
-    // MARK: - Ducking hysteresis
-
-    /// Restore the system volume only after the voice has been idle for a
-    /// good while. Translated sentences arrive tens of seconds apart in a
-    /// slow meeting, and a short grace restored/re-ducked the original
-    /// around every one — heard as the background suddenly blaring between
-    /// sentences. Eight seconds keeps the level steady through a session's
-    /// natural gaps; the duck factor (0.5) keeps the original audible
-    /// meanwhile.
-    private func scheduleUnduck() {
-        guard duckOthers else { return }
-        cancelUnduck()
-        let work = DispatchWorkItem { SystemAudio.unduckOutput() }
-        unduckWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: work)
-    }
-
-    private func cancelUnduck() {
-        unduckWork?.cancel()
-        unduckWork = nil
-    }
+    // Ducking is session-scoped (AppDelegate ducks at interpreter start
+    // and restores at session end): per-sentence duck/unduck swung BOTH
+    // volumes — the original blared back in every gap, and because the
+    // voice rides the same system volume, a sentence starting right after
+    // an unduck played twice as loud. A steady 0.5× floor for the whole
+    // session keeps both levels constant.
 
     // MARK: - Voice mapping
 
