@@ -129,6 +129,21 @@ final class SpeechGate {
             } else if wasRecentlySpoken(sentence) {
                 SpeechService.diag("gate skip(content) \"\(sentence.prefix(40))\"")
             } else {
+                // Speaking against an outstanding balance means this
+                // conclusion outgrew its early-spoken sentence (merged with
+                // unspoken content — the size check failed). Order
+                // preservation says it PASSED the ledger's head, so settle
+                // that head now: a zombie balance would otherwise swallow
+                // the next innocent sentence (observed: a fresh sentence
+                // skipped against a 28 s-old leftover). The cost is one
+                // duplicated stretch here — information loss would be worse.
+                if earlyBalance > 0 {
+                    let head = earlyMarks.first?.scalars ?? earlyBalance
+                    if !earlyMarks.isEmpty { earlyMarks.removeFirst() }
+                    earlyBalance = max(0, earlyBalance - head)
+                    if earlyMarks.isEmpty { earlyBalance = 0 }
+                    SpeechService.diag("gate ledger write-off \(head) (conclusion outgrew early speech)")
+                }
                 toSpeak += toSpeak.isEmpty ? sentence : " " + sentence
                 rememberSpoken(sentence)
             }

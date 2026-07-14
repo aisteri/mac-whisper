@@ -422,14 +422,18 @@ final class SpeechOutput {
     // MARK: - Ducking hysteresis
 
     /// Restore the system volume only after the voice has been idle for a
-    /// good while — sentence gaps run 1–2 s, and restoring inside them made
-    /// the master volume pump up and down through the whole session.
+    /// good while. Translated sentences arrive tens of seconds apart in a
+    /// slow meeting, and a short grace restored/re-ducked the original
+    /// around every one — heard as the background suddenly blaring between
+    /// sentences. Eight seconds keeps the level steady through a session's
+    /// natural gaps; the duck factor (0.5) keeps the original audible
+    /// meanwhile.
     private func scheduleUnduck() {
         guard duckOthers else { return }
         cancelUnduck()
         let work = DispatchWorkItem { SystemAudio.unduckOutput() }
         unduckWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: work)
     }
 
     private func cancelUnduck() {
