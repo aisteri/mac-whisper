@@ -609,9 +609,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
                 return $0.name < $1.name
             }
         for voice in voices {
-            let suffix = voice.quality == .premium ? " (Premium)"
-                : voice.quality == .enhanced ? " (Enhanced)" : ""
-            voicePopup.addItem(withTitle: voice.name + suffix)
+            // Recent macOS already bakes the quality into the name
+            // ("Jian (Premium)") — only label voices that don't carry it.
+            let quality = voice.quality == .premium ? "Premium"
+                : voice.quality == .enhanced ? "Enhanced" : ""
+            let title = quality.isEmpty || voice.name.contains(quality)
+                ? voice.name : "\(voice.name) (\(quality))"
+            voicePopup.addItem(withTitle: title)
             voicePopup.lastItem?.representedObject = voice.identifier
         }
         selectByRepresented(voicePopup, s.speechVoiceIdentifier)
