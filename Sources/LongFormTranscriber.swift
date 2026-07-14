@@ -101,8 +101,10 @@ final class LongFormTranscriber {
     private let minFinalizeSpacing: TimeInterval = 1.5
     /// Past this without a finalize, any ink-dry lull commits (see the
     /// cadence note in trackVoiceActivity) — continuous speech must not
-    /// starve finalization.
-    private let cadenceFinalizeAfter: TimeInterval = 4.0
+    /// starve finalization. 2.5 s ≈ a human interpreter's ear-voice span;
+    /// earlier commits trade a little recognition-revision headroom for
+    /// pace, which is this app's stated priority.
+    private let cadenceFinalizeAfter: TimeInterval = 2.5
 
     private func trackVoiceActivity(_ level: Float) {
         // ~20 ms per buffer; 0.995^n halves the envelope in roughly 3 s.
