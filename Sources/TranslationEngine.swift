@@ -203,6 +203,7 @@ final class TranslationEngine {
         generation &+= 1
         utterances.removeAll()
         spokenIDs.removeAll()
+        spokenSources.removeAll()
         concludedSpeech = ""
         liveRequest = nil
         qualityRequest = nil
@@ -518,8 +519,25 @@ final class TranslationEngine {
     /// though both the seal hook and the quality pass can produce its text.
     private var spokenIDs: Set<Int> = []
 
+    /// Normalized SOURCES of utterances already handed to the voice. The
+    /// recognizer sometimes re-transcribes the same audio into a separate
+    /// utterance; its translation can be reworded beyond recognition, but
+    /// the source text stays nearly identical — so duplicate detection
+    /// belongs at the source level, before translation scrambles it.
+    private var spokenSources: [String] = []
+
     private func emitSpeakable(_ text: String, id: Int) {
         guard !text.isEmpty, spokenIDs.insert(id).inserted else { return }
+        if let source = utterances.first(where: { $0.id == id })?.source {
+            let norm = SpeechGate.normalize(source)
+            if norm.unicodeScalars.count >= 10,
+               spokenSources.contains(where: { SpeechGate.bigramSimilar(norm, $0) }) {
+                SpeechService.diag("translate dedup(source) \"\(text.prefix(40))\"")
+                return
+            }
+            spokenSources.append(norm)
+            if spokenSources.count > 6 { spokenSources.removeFirst() }
+        }
         if onSpeechStreams != nil {
             // Gate mode: the utterance joins the concluded stream (the "\n"
             // is the sentence boundary) and the gate reconciles it against
