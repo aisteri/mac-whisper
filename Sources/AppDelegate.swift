@@ -532,7 +532,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
             }
             speechGate.reset()
+            // Early speech suits DeepL only: its tentative is the SAME
+            // pipeline's earlier draft. The Apple path re-translates a
+            // moving transcript hypothesis, so its live line rewrites
+            // wholesale — early-speaking it produced triple readings
+            // (measured). Apple speaks concluded translations only.
             speechGate.earlySpeech = settings.earlySpeechEnabled
+                && !settings.appleTranslationEnabled
             voiceSpokenCaption = ""
             // The gate drives speech AND captions for the stream-shaped
             // providers (DeepL Voice, Apple); the LLM path keeps the legacy

@@ -52,6 +52,17 @@ final class SpeechGate {
     /// ledger.
     private var spokenTail = ""
     private let spokenTailCap = 600 // unicode scalars, ~5-6 sentences
+    /// The last few spoken pieces individually, for the fuzzy neighbor
+    /// check: the Apple path's recognizer re-transcribes the same audio
+    /// into SEPARATE utterances (re-split, analyzer rebuilds), so the same
+    /// content re-enters the concluded stream as a heavy rewrite that
+    /// neither the ledger (already settled) nor the exact-substring check
+    /// can see. Only the newest pieces are compared, keeping the false-
+    /// positive surface small — genuinely similar NEIGHBORING sentences
+    /// are rare, and a meeting speaker repeating one verbatim is fine to
+    /// dedup anyway.
+    private var spokenPieces: [String] = []
+    private let spokenPiecesCap = 4
 
     /// Unspoken stable-sentence candidate being watched for stability.
     private var candidate = ""
@@ -91,6 +102,7 @@ final class SpeechGate {
         earlyBalance = 0
         earlyMarks = []
         spokenTail = ""
+        spokenPieces = []
         clearCandidate()
     }
 
@@ -199,17 +211,27 @@ final class SpeechGate {
 
     /// Content backstop: the sentence's normalized form appears within
     /// recently spoken text (six-scalar minimum so trivial echoes like a
-    /// lone "네" can't false-match).
+    /// lone "네" can't false-match), or it is a heavy rewrite of one of
+    /// the last few spoken pieces (bigram similarity — see spokenPieces).
     private func wasRecentlySpoken(_ sentence: String) -> Bool {
         let norm = Self.normalize(sentence)
-        return norm.unicodeScalars.count >= 6 && spokenTail.contains(norm)
+        guard norm.unicodeScalars.count >= 6 else { return false }
+        if spokenTail.contains(norm) { return true }
+        return spokenPieces.contains { Self.bigramSimilar(norm, $0) }
     }
 
     private func rememberSpoken(_ sentence: String) {
-        spokenTail += Self.normalize(sentence)
+        let norm = Self.normalize(sentence)
+        spokenTail += norm
         let scalars = spokenTail.unicodeScalars
         if scalars.count > spokenTailCap {
             spokenTail = String(String.UnicodeScalarView(scalars.suffix(spokenTailCap)))
+        }
+        if norm.unicodeScalars.count >= 6 {
+            spokenPieces.append(norm)
+            if spokenPieces.count > spokenPiecesCap {
+                spokenPieces.removeFirst(spokenPieces.count - spokenPiecesCap)
+            }
         }
     }
 
@@ -409,6 +431,31 @@ final class SpeechGate {
         let prefix = String(text[..<cut])
         guard normalize(prefix).unicodeScalars.count >= 8 else { return "" }
         return prefix
+    }
+
+    /// Whether two NORMALIZED strings say the same thing through a heavy
+    /// rewrite (word order moved, connectives swapped) — jamo-bigram set
+    /// overlap, which survives reordering that defeats prefix comparison.
+    /// 0.65, deliberately strict: structurally parallel but DIFFERENT
+    /// neighboring sentences ("매출은 90만" / "지출은 80만") must not match.
+    static func bigramSimilar(_ x: String, _ y: String) -> Bool {
+        let a = Array(x.unicodeScalars), b = Array(y.unicodeScalars)
+        // Length ratio ≤1.3: a REWRITE keeps roughly the same size. A
+        // conclusion that merged NEW content past what was spoken is
+        // longer — it must fall through and speak (information first).
+        guard a.count >= 10, b.count >= 10,
+              Double(max(a.count, b.count)) <= Double(min(a.count, b.count)) * 1.3 else { return false }
+        func bigrams(_ s: [Unicode.Scalar]) -> Set<UInt64> {
+            var out = Set<UInt64>()
+            for i in 0..<(s.count - 1) {
+                out.insert(UInt64(s[i].value) << 32 | UInt64(s[i + 1].value))
+            }
+            return out
+        }
+        let ba = bigrams(a), bb = bigrams(b)
+        let inter = ba.intersection(bb).count
+        let union = ba.union(bb).count
+        return union > 0 && Double(inter) / Double(union) >= 0.65
     }
 
     /// Whether two NORMALIZED strings are light rewrites of each other —

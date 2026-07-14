@@ -56,7 +56,10 @@ final class SubtitleOverlay {
     private var lastContent = ""
     private var lastContentAt = Date.distantPast
     private var idleTimer: Timer?
-    private let idleFadeAfter: TimeInterval = 4.0
+    /// 12 s, not shorter: interpreter captions update only when the voice
+    /// speaks, and translated sentences legitimately arrive ten-plus
+    /// seconds apart — a 4 s fade kept vanishing captions mid-meeting.
+    private let idleFadeAfter: TimeInterval = 12.0
 
     init() {
         let rect = NSRect(x: 0, y: 0, width: 400, height: 44)
