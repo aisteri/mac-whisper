@@ -47,15 +47,18 @@ final class SpeechOutput {
     private let voiceBoost: Float = 2.4
 
     /// Base speech rate: 10% above the system default (user-tuned: default
-    /// read as sluggish, +25% as rushed). When text backs up behind a busy
-    /// voice the rate scales up to `maxRateMultiplier` so the voice catches
-    /// the conversation instead of drifting ever further behind — and falls
+    /// read as sluggish, +25% as rushed). When playback backs up the rate
+    /// scales up to `maxRateMultiplier` so the voice catches the
+    /// conversation instead of drifting ever further behind — and falls
     /// straight back once the backlog clears (re-evaluated every utterance).
+    /// Backlog is measured as SCHEDULED-BUT-UNPLAYED SECONDS, not buffered
+    /// characters: rendering runs ~50× realtime, so text is scheduled almost
+    /// the moment it arrives and the queue lives in the player, not here.
     private let baseRateMultiplier: Double = 1.1
     private let maxRateMultiplier: Double = 1.35
-    /// Backlog (chars) where the rate starts climbing / tops out.
-    private let rateRampStart = 40
-    private let rateRampEnd = 240
+    /// Pending playback (seconds) where the rate starts climbing / tops out.
+    private let rateRampStart: Double = 2.0
+    private let rateRampEnd: Double = 12.0
 
     /// How long an idle voice waits for more shards before speaking an
     /// unterminated fragment. A slow speaker produces small shards with real
@@ -86,7 +89,14 @@ final class SpeechOutput {
     private var cachedVoice: AVSpeechSynthesisVoice?
 
     private var buffer = ""
-    private var speaking = false
+    /// An utterance is being RENDERED (not played — rendering finishing is
+    /// what triggers the next pump, so the next utterance's audio lands
+    /// behind the current one in the player with no audible gap; waiting
+    /// for playback instead put the whole render latency between sentences).
+    private var rendering = false
+    /// Frames handed to the player since it last started, against
+    /// player.playerTime — their difference is the unplayed backlog.
+    private var scheduledFrames: Double = 0
     /// When the oldest unspoken text arrived (buffer was empty), for the
     /// queue-wait diagnostic; nil while nothing waits.
     private var oldestEnqueueAt: Date?
@@ -120,10 +130,11 @@ final class SpeechOutput {
     private func handleOutputDeviceChange() {
         SpeechService.diag("speech output device changed — reconnecting engine")
         player.stop()
+        scheduledFrames = 0
         if let format = connectedFormat {
             engine.connect(player, to: engine.mainMixerNode, format: format)
         }
-        speaking = false
+        rendering = false
         pump()
     }
 
@@ -179,7 +190,8 @@ final class SpeechOutput {
     func reset() {
         generation &+= 1
         buffer = ""
-        speaking = false
+        rendering = false
+        scheduledFrames = 0
         oldestEnqueueAt = nil
         utteranceStartedAt = nil
         cachedVoice = nil
@@ -207,25 +219,26 @@ final class SpeechOutput {
 
     // MARK: - Pipeline
 
-    /// Speaks the next chunk of the accumulated buffer as one utterance.
-    /// Text arriving while the voice is busy simply waits for the next pump —
-    /// that is what merges shards into continuous speech.
+    /// Renders the next chunk of the accumulated buffer as one utterance.
+    /// Text arriving while an utterance renders simply waits for the next
+    /// pump — that is what merges shards into continuous speech.
     private func pump() {
-        guard !speaking, !buffer.isEmpty else { return }
-        speaking = true
+        guard !rendering, !buffer.isEmpty else { return }
+        rendering = true
         let text = takeChunk()
         let gen = generation
 
         // Queue-wait: how long the oldest text sat behind the previous
-        // utterance. The rate ramp answers backlog with faster speech.
+        // utterance. The rate ramp answers playback backlog with faster
+        // speech.
         let waitMs = oldestEnqueueAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? 0
         oldestEnqueueAt = buffer.isEmpty ? nil : Date()
-        let backlog = text.count + buffer.count
-        let ramp = min(1.0, max(0.0, Double(backlog - rateRampStart) / Double(rateRampEnd - rateRampStart)))
+        let pending = pendingPlaybackSeconds()
+        let ramp = min(1.0, max(0.0, (pending - rateRampStart) / (rateRampEnd - rateRampStart)))
         let multiplier = baseRateMultiplier + (maxRateMultiplier - baseRateMultiplier) * ramp
         utteranceStartedAt = Date()
-        SpeechService.diag(String(format: "tts pump chars=%d backlog=%d rate=%.2f wait=%dms",
-                                  text.count, buffer.count, multiplier, waitMs))
+        SpeechService.diag(String(format: "tts pump chars=%d pending=%.1fs rate=%.2f wait=%dms",
+                                  text.count, pending, multiplier, waitMs))
 
         if duckOthers {
             cancelUnduck()
@@ -242,12 +255,11 @@ final class SpeechOutput {
             // but all state changes bounce to main.
             guard let self, let pcm = rendered as? AVAudioPCMBuffer else { return }
             if pcm.frameLength == 0 {
-                // End marker (can fire more than once). Chain the finish
-                // callback behind everything scheduled so far.
+                // End marker (can fire more than once): rendering is done.
                 if sawEnd { return }
                 sawEnd = true
                 DispatchQueue.main.async { [weak self] in
-                    self?.finishAfterScheduled(gen: gen)
+                    self?.renderFinished(gen: gen)
                 }
                 return
             }
@@ -255,6 +267,29 @@ final class SpeechOutput {
                 self?.schedule(pcm, gen: gen)
             }
         }
+    }
+
+    /// Rendering finished — the player is still speaking the tail of this
+    /// utterance. Pumping NOW is the whole point of the split pipeline: the
+    /// next utterance renders while this one plays and its audio lands
+    /// seamlessly behind, instead of the render latency becoming silence.
+    private func renderFinished(gen: Int) {
+        guard gen == generation else { return }
+        rendering = false
+        if buffer.isEmpty {
+            scheduleIdleMarker(gen: gen)
+        } else {
+            pump()
+        }
+    }
+
+    /// Seconds of audio scheduled but not yet played out.
+    private func pendingPlaybackSeconds() -> Double {
+        guard let nodeTime = player.lastRenderTime,
+              let playerTime = player.playerTime(forNodeTime: nodeTime),
+              playerTime.sampleRate > 0 else { return 0 }
+        let played = Double(playerTime.sampleTime)
+        return max(0, (scheduledFrames - played) / playerTime.sampleRate)
     }
 
     /// Takes the next utterance's worth of text off the buffer: everything up
@@ -356,25 +391,22 @@ final class SpeechOutput {
         }
         if !player.isPlaying { player.play() }
         player.scheduleBuffer(pcm)
+        scheduledFrames += Double(pcm.frameLength)
     }
 
-    /// Queues a completion marker behind all scheduled audio; fires when the
-    /// utterance has fully played out.
-    private func finishAfterScheduled(gen: Int) {
+    /// Queues a marker behind all scheduled audio; when it plays out and
+    /// nothing new is rendering or waiting, the voice is truly idle — time
+    /// to restore the ducked system volume. (Playback completion no longer
+    /// drives the pump; renderFinished does.)
+    private func scheduleIdleMarker(gen: Int) {
         guard gen == generation, let format = connectedFormat,
-              let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else {
-            speaking = false
-            return
-        }
+              let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return }
         marker.frameLength = 1
         player.scheduleBuffer(marker) { [weak self] in
             DispatchQueue.main.async {
                 guard let self, gen == self.generation else { return }
-                self.speaking = false
-                if self.buffer.isEmpty {
+                if !self.rendering, self.buffer.isEmpty {
                     self.scheduleUnduck()
-                } else {
-                    self.pump()
                 }
             }
         }
