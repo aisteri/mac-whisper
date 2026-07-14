@@ -131,6 +131,8 @@ final class SpeechOutput {
     /// The progress timer maps the play head into character positions.
     private var playbackQueue: [(text: String, startFrame: Double, totalFrames: Double)] = []
     private var progressTimer: Timer?
+    /// Consecutive empty-queue ticks before the drain signal fires.
+    private var drainTicks = 0
     /// When the oldest unspoken text arrived (buffer was empty), for the
     /// queue-wait diagnostic; nil while nothing waits.
     private var oldestEnqueueAt: Date?
@@ -332,13 +334,23 @@ final class SpeechOutput {
             playbackQueue.removeFirst()
         }
         if let current = playbackQueue.first, played >= current.startFrame, current.totalFrames > 0 {
+            drainTicks = 0
             let progress = (played - current.startFrame) / current.totalFrames
             let upTo = min(current.text.count, Int((progress * Double(current.text.count)).rounded()))
             onSpeakingProgress?(current.text, upTo)
         } else if playbackQueue.isEmpty, renderingUtterance == nil, !isSpeaking {
-            onSpeakingProgress?("", 0)
-            progressTimer?.invalidate()
-            progressTimer = nil
+            // Debounce the drain signal: the queue dips empty for a beat
+            // between utterances, and reporting "done" instantly made the
+            // highlighted line vanish and reappear at every sentence edge.
+            drainTicks += 1
+            if drainTicks >= 5 { // ~0.5 s of genuine silence
+                drainTicks = 0
+                onSpeakingProgress?("", 0)
+                progressTimer?.invalidate()
+                progressTimer = nil
+            }
+        } else {
+            drainTicks = 0
         }
     }
 

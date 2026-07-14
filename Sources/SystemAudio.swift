@@ -142,17 +142,32 @@ enum SystemAudio {
         userVolume = (device, volume)
         duckedDevice = device
         preDuckVolume = volume
+        duckTargetVolume = volume * factor
         rampOutputVolume(device, from: sampled, to: volume * factor)
         diag("ducked output \(volume) -> \(volume * factor)")
         return true
     }
 
-    /// Restore the volume we ducked. No-op unless duckOutput ran.
+    /// The level the duck ramped down to; at restore time, a current volume
+    /// away from this means the USER adjusted it mid-session.
+    private static var duckTargetVolume: Float?
+
+    /// Restore the volume we ducked. No-op unless duckOutput ran. When the
+    /// user turned the volume up (or down) DURING the ducked session, that
+    /// choice wins — snapping back to the pre-session level made every
+    /// manual adjustment mysteriously "undo itself" at session end.
     static func unduckOutput() {
         guard let device = duckedDevice, let volume = preDuckVolume else { return }
         duckedDevice = nil
         preDuckVolume = nil
+        let target = duckTargetVolume
+        duckTargetVolume = nil
         let current = outputVolume(device) ?? volume
+        if let target, abs(current - target) > max(0.05, target * 0.25) {
+            userVolume = (device, current)
+            diag("unduck: user set \(current) during the session — keeping it")
+            return
+        }
         rampOutputVolume(device, from: current, to: volume)
         diag("unducked output -> \(volume)")
     }

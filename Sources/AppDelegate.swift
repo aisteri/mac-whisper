@@ -942,8 +942,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard gateDrivesCaptions else { return }
         var pieces: [(text: String, style: SubtitleOverlay.CaptionStyle)] = []
         let (sentences, remainder) = SpeechGate.splitSentences(voiceSpokenCaption)
-        let keep = speakingText.isEmpty ? 2 : 1
-        let spokenTail = (sentences.suffix(keep) + [remainder])
+        // A FIXED number of trailing sentences: varying it with the speaking
+        // state made earlier lines pop in and out at every utterance edge.
+        let spokenTail = (sentences.suffix(2) + [remainder])
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !spokenTail.isEmpty {
@@ -968,6 +969,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let preview = (sentences.suffix(1) + [remainder])
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // The tentative goes briefly empty the moment it concludes; blanking
+        // the preview line then made it flicker. Keep the old preview — the
+        // next update replaces it, and the idle fade clears a stale one.
+        guard !preview.isEmpty else { return }
         pendingPreview = String(preview.suffix(120))
         renderGateCaption()
     }
