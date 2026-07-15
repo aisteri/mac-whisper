@@ -263,7 +263,19 @@ final class TranslationEngine {
                 let stablePart = String(live.prefix(stableInLive))
                 let (done, remainder) = SpeechGate.splitSentences(stablePart)
                 lines.append(contentsOf: done)
-                let rest = remainder.trimmingCharacters(in: .whitespaces)
+                var rest = remainder.trimmingCharacters(in: .whitespaces)
+                // Punctuation starvation: zh transcription often delays the
+                // "。" for many seconds, so final text piles up with no
+                // sentence to promote — then settles as one big blob (the
+                // caption whooshes several lines at once). Once enough
+                // UNPROMOTED final text accumulates, cut at clause commas
+                // instead. First-boundary-from-the-front keeps the split
+                // deterministic as the final prefix grows; a last-boundary
+                // rule would re-cut ahead of already-promoted clauses.
+                while rest.count >= 25, let cut = Self.firstClauseCut(in: rest, after: 12) {
+                    lines.append(String(rest[..<cut]))
+                    rest = String(rest[cut...]).trimmingCharacters(in: .whitespaces)
+                }
                 liveSource = rest.isEmpty ? nil : rest
             }
         }
@@ -321,6 +333,22 @@ final class TranslationEngine {
     private func mintID() -> Int {
         defer { nextID += 1 }
         return nextID
+    }
+
+    /// End index just past the FIRST clause comma at or after `minChars`
+    /// (a comma directly followed by a digit — "1,000" — doesn't count).
+    private static func firstClauseCut(in text: String, after minChars: Int) -> String.Index? {
+        let boundaries: Set<Character> = [",", "、", "，", ";", "；"]
+        guard text.count > minChars else { return nil }
+        var i = text.index(text.startIndex, offsetBy: minChars)
+        while i < text.endIndex {
+            if boundaries.contains(text[i]) {
+                let next = text.index(after: i)
+                if next == text.endIndex || !text[next].isNumber { return next }
+            }
+            i = text.index(after: i)
+        }
+        return nil
     }
 
     // MARK: - Scheduling
