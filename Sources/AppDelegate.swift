@@ -1,7 +1,8 @@
 import Cocoa
 import ApplicationServices
+import UserNotifications
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private let fnMonitor = FnKeyMonitor()
     private let speech = SpeechService()
@@ -90,6 +91,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         requestPermissionsAndStart()
         wireSpeech()
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    // MARK: - Notes-done notifications
+
+    /// Posts a user notification (asking permission on first use). Tapping
+    /// a notification that carries a file path opens that file.
+    private func notify(title: String, body: String, fileURL: URL? = nil) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            if let fileURL { content.userInfo = ["file": fileURL.path] }
+            center.add(UNNotificationRequest(identifier: UUID().uuidString,
+                                             content: content, trigger: nil))
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let path = response.notification.request.content.userInfo["file"] as? String {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
 
     /// A menu-bar app has no visible main menu — but without one, ⌘C/⌘V/⌘X
@@ -160,6 +194,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(header)
         menu.addItem(.separator())
 
+        // Post-recording work (meeting notes, refinement) runs for minutes
+        // after a session ends; surface it so "is it still going?" has an
+        // answer one glance away.
+        if postRecordingTasks > 0 {
+            let busy = NSMenuItem(title: "회의록 생성 중… (앱을 종료하지 마세요)",
+                                  action: nil, keyEquivalent: "")
+            busy.isEnabled = false
+            busy.image = menuIcon("hourglass")
+            menu.addItem(busy)
+            menu.addItem(.separator())
+        }
+
         // Core action: start/stop a locked (hands-free) recording — saved to
         // ~/Documents/MacTranscribe. Everything configurable lives in Settings.
         let lockTitle = isLockedRecording ? "Stop Recording & Save" : "Start Recording"
@@ -207,7 +253,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Reflect the locked-recording state in the menu-bar icon so a running
         // capture is visible even with no HUD and the window closed.
         if let button = statusItem.button {
-            let symbol = isLockedRecording ? "record.circle" : "mic.fill"
+            let symbol = isLockedRecording ? "record.circle"
+                : postRecordingTasks > 0 ? "hourglass" : "mic.fill"
             button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Mac Transcribe")
             button.image?.isTemplate = true
         }
@@ -753,10 +800,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// running. The sleep-prevention activity stays alive until this hits 0.
     private var postRecordingTasks = 0
 
-    private func beginPostRecordingTask() { postRecordingTasks += 1 }
+    private func beginPostRecordingTask() {
+        postRecordingTasks += 1
+        rebuildMenu() // hourglass on
+    }
 
     private func endPostRecordingTask() {
         postRecordingTasks = max(0, postRecordingTasks - 1)
+        rebuildMenu() // hourglass off when the last task ends
         if postRecordingTasks == 0 {
             if let activity = sleepActivity {
                 ProcessInfo.processInfo.endActivity(activity)
@@ -1075,6 +1126,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         NSLog("MacTranscribe[App]: meeting notes saved chars=\(notes.count)")
                         SpeechService.diag("meeting notes saved -> \(url.lastPathComponent)")
                         self.transcriptWindow.setStatus("Meeting notes saved: \(url.lastPathComponent)")
+                        self.notify(title: "회의록 저장 완료",
+                                    body: url.lastPathComponent + " — 클릭하면 열립니다",
+                                    fileURL: url)
                         NSWorkspace.shared.activateFileViewerSelecting([url])
                     } catch {
                         NSLog("MacTranscribe[App]: failed to save meeting notes: \(error)")
@@ -1083,6 +1137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NSLog("MacTranscribe[App]: meeting notes failed: \(error.localizedDescription)")
                     SpeechService.diag("meeting notes FAILED: \(error.localizedDescription)")
                     self.transcriptWindow.setStatus("Meeting notes failed — transcript is saved")
+                    self.notify(title: "회의록 생성 실패",
+                                body: "전사 원문은 저장되어 있습니다.")
                 }
                 self.endPostRecordingTask()
             }
