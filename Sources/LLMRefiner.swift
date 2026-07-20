@@ -47,14 +47,49 @@ enum LLMRefiner {
     /// System prompt for turning a raw meeting transcript into formal,
     /// detailed minutes. The glossary is appended so domain terms come out
     /// right. `meetingDate` (the recording timestamp) fills the 일시 field.
-    private static func meetingNotesPrompt(meetingDate: String) -> String {
+    /// `attendees` is what the user typed when prompted after the recording;
+    /// empty means they declined or the prompt timed out, in which case the
+    /// minutes must stay free of speaker identity (the transcript has none).
+    /// Rule 2 when the user gave no attendee list: the transcript alone carries
+    /// no speaker identity, so none may appear in the minutes.
+    private static let noRosterRule = """
+        2. The transcript carries no reliable speaker identity, so the minutes must \
+        contain none. Do not list attendees or participants, do not attribute any \
+        statement to a named person, and do not assign an owner to an action item. \
+        Write the discussion impersonally ("…하기로 함", "…라는 의견이 있었음"). A \
+        person's name belongs in the minutes only where it was the subject the meeting \
+        talked about, never as the source of a remark.
+        """
+
+    /// Rule 2 when the user supplied a roster. The roster is authoritative for
+    /// *who was there* — but the transcript is still un-diarized, so it grants
+    /// no license to guess who said which line.
+    private static func rosterRule(_ roster: String) -> String {
+        """
+        2. The user supplied the attendee list below. Reproduce it in the overview \
+        as given — do not add, drop, or re-spell names, and never promote a name \
+        found elsewhere (the transcript, the glossary) into the attendee list.
+
+        \(roster)
+
+        The transcript itself is not speaker-labelled, so knowing who was in the room \
+        does not tell you who said a given line. Attribute a statement, or name the \
+        owner of an action item, only where the transcript says so outright ("제가 \
+        하겠습니다" next to a name, "○○님이 맡기로"). Everywhere else write \
+        impersonally ("…하기로 함", "…라는 의견이 있었음"). Do not add a \
+        per-attendee section or split action items by person.
+        """
+    }
+
+    static func meetingNotesPrompt(meetingDate: String, attendees: String = "") -> String {
+        let roster = attendees.trimmingCharacters(in: .whitespacesAndNewlines)
         var prompt = """
         You are a professional minute-taker. Turn the raw speech-to-text transcript of a \
         meeting into meeting minutes (회의록), written in the SAME language as the \
         transcript (do not translate). Localize all headings and labels to that language.
 
         Minimum required content — always include, as far as the transcript supports it:
-        - A title and a meeting overview: date/time (use "\(meetingDate)") and the \
+        - A title and a meeting overview: date/time (use "\(meetingDate)")\(roster.isEmpty ? "" : ", the attendees listed below") and the \
         agenda items that were discussed.
         - The discussion itself: what was talked about, with the reasons, trade-offs, \
         numbers, dates, examples, and concerns that were actually raised.
@@ -67,7 +102,7 @@ enum LLMRefiner {
 
         Length is not a constraint, in either direction — never shorten the minutes to \
         be tidy. Do not summarize away substance: a reader who missed the meeting must \
-        be able to follow each discussion — who said what, why, what was weighed, and \
+        be able to follow each discussion — what was raised, why, what was weighed, and \
         how it landed. When in doubt whether a point is substantive, include it. Leave \
         out only filler, small talk, and verbatim repetition.
 
@@ -82,12 +117,7 @@ enum LLMRefiner {
         1. The transcript comes from speech recognition and contains mis-recognized \
         words; silently correct them from context. Never invent content — attendees, \
         decisions, dates — that the transcript does not support.
-        2. The transcript carries no reliable speaker identity, so the minutes must \
-        contain none. Do not list attendees or participants, do not attribute any \
-        statement to a named person, and do not assign an owner to an action item. \
-        Write the discussion impersonally ("…하기로 함", "…라는 의견이 있었음"). A \
-        person's name belongs in the minutes only where it was the subject the meeting \
-        talked about, never as the source of a remark.
+        \(roster.isEmpty ? Self.noRosterRule : Self.rosterRule(roster))
         3. Output Markdown, and only the document itself — no preamble or commentary.
         """
         let glossary = Settings.shared.glossaryText
@@ -129,9 +159,10 @@ enum LLMRefiner {
     static func generateMeetingNotesViaClaude(
         from transcript: String,
         meetingDate: String,
+        attendees: String = "",
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        let prompt = meetingNotesPrompt(meetingDate: meetingDate)
+        let prompt = meetingNotesPrompt(meetingDate: meetingDate, attendees: attendees)
         let input = prompt + "\n\n" + transcript
         DispatchQueue.global(qos: .userInitiated).async {
             let claudePath = Self.claudeCLIPath()
@@ -292,7 +323,7 @@ enum LLMRefiner {
     /// Generate formal meeting minutes from a raw long-form transcript,
     /// using the configured provider and the user's glossary. `meetingDate`
     /// is the recording timestamp shown in the 회의 개요 table.
-    static func generateMeetingNotes(from transcript: String, meetingDate: String, completion: @escaping (Result<String, Error>) -> Void) {
+    static func generateMeetingNotes(from transcript: String, meetingDate: String, attendees: String = "", completion: @escaping (Result<String, Error>) -> Void) {
         let settings = Settings.shared
         request(
             text: transcript,
@@ -300,7 +331,7 @@ enum LLMRefiner {
             apiKey: settings.llmAPIKey,
             model: settings.llmModel,
             proto: settings.llmProtocol,
-            systemPrompt: meetingNotesPrompt(meetingDate: meetingDate),
+            systemPrompt: meetingNotesPrompt(meetingDate: meetingDate, attendees: attendees),
             reasoningEffort: "medium",
             completion: completion
         )

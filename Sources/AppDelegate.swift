@@ -1100,13 +1100,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// How long the attendee prompt waits before generating without a roster.
+    /// A meeting often ends with the user walking away from the desk, so the
+    /// dialog must never be able to stall the minutes indefinitely.
+    private static let attendeePromptTimeout: TimeInterval = 45
+
+    /// Asks who attended, and returns what was typed — or "" if the user
+    /// declined or said nothing within `attendeePromptTimeout`. Runs modally on
+    /// the main thread; the timer is registered in the common modes so it still
+    /// fires while the modal loop owns the run loop.
+    private func askAttendees() -> String {
+        let alert = NSAlert()
+        alert.messageText = "회의 참석자"
+        alert.informativeText = """
+            회의록에 넣을 참석자를 입력하세요. 쉼표나 줄바꿈으로 구분합니다.
+            비워 두거나 \(Int(Self.attendeePromptTimeout))초 안에 응답이 없으면 참석자 없이 생성합니다.
+            """
+        alert.addButton(withTitle: "회의록 생성")
+        alert.addButton(withTitle: "참석자 없이 생성")
+
+        let field = NSTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 68))
+        field.font = .systemFont(ofSize: 13)
+        field.isRichText = false
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 68))
+        scroll.documentView = field
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        alert.accessoryView = scroll
+        alert.window.initialFirstResponder = field
+
+        // A menu-bar app has no active window of its own; without this the
+        // dialog opens behind whatever the user was looking at.
+        NSApp.activate(ignoringOtherApps: true)
+        let timer = Timer(timeInterval: Self.attendeePromptTimeout, repeats: false) { _ in
+            SpeechService.diag("attendee prompt timed out")
+            NSApp.abortModal()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        let response = alert.runModal()
+        timer.invalidate()
+
+        guard response == .alertFirstButtonReturn else { return "" }
+        return field.string.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Generates structured meeting notes from the raw transcript via the LLM
     /// (glossary included in the prompt) and saves them as notes-<stamp>.md.
     /// Failures only log — the transcript file is already safe on disk.
     private func generateMeetingNotes(from transcript: String, stamp: String) {
+        let attendees = askAttendees()
         beginPostRecordingTask()
         NSLog("MacTranscribe[App]: generating meeting notes chars=\(transcript.count)")
-        SpeechService.diag("meeting notes generating chars=\(transcript.count)")
+        SpeechService.diag("meeting notes generating chars=\(transcript.count) attendees=\(attendees.isEmpty ? "none" : "\(attendees.split(whereSeparator: { ",\n".contains($0) }).count)")")
         // Minutes for a long meeting take a few minutes to write; without a
         // visible status users read the wait as "notes were never made" (and
         // may quit the app mid-generation, which really does lose them).
@@ -1144,9 +1189,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
         if provider == "claude" {
-            LLMRefiner.generateMeetingNotesViaClaude(from: transcript, meetingDate: meetingDate, completion: handler)
+            LLMRefiner.generateMeetingNotesViaClaude(from: transcript, meetingDate: meetingDate,
+                                                     attendees: attendees, completion: handler)
         } else {
-            LLMRefiner.generateMeetingNotes(from: transcript, meetingDate: meetingDate, completion: handler)
+            LLMRefiner.generateMeetingNotes(from: transcript, meetingDate: meetingDate,
+                                            attendees: attendees, completion: handler)
         }
     }
 
