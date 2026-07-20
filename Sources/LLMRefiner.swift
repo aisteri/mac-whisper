@@ -54,14 +54,12 @@ enum LLMRefiner {
         transcript (do not translate). Localize all headings and labels to that language.
 
         Minimum required content — always include, as far as the transcript supports it:
-        - A title and a meeting overview: date/time (use "\(meetingDate)"), the \
-        attendees identifiable from the transcript, and the agenda items that were \
-        discussed.
-        - The discussion itself: what was talked about and by whom, with the reasons, \
-        trade-offs, numbers, dates, names, examples, and concerns that were actually \
-        raised.
-        - Decisions that were made, and action items (with owner and due date when one \
-        was mentioned).
+        - A title and a meeting overview: date/time (use "\(meetingDate)") and the \
+        agenda items that were discussed.
+        - The discussion itself: what was talked about, with the reasons, trade-offs, \
+        numbers, dates, examples, and concerns that were actually raised.
+        - Decisions that were made, and action items (with a due date when one was \
+        mentioned).
 
         Beyond that minimum, choose the structure, depth, and length that best fit this \
         particular meeting. A decision meeting, a brainstorm, a status sync, and a \
@@ -84,7 +82,13 @@ enum LLMRefiner {
         1. The transcript comes from speech recognition and contains mis-recognized \
         words; silently correct them from context. Never invent content — attendees, \
         decisions, dates — that the transcript does not support.
-        2. Output Markdown, and only the document itself — no preamble or commentary.
+        2. The transcript carries no reliable speaker identity, so the minutes must \
+        contain none. Do not list attendees or participants, do not attribute any \
+        statement to a named person, and do not assign an owner to an action item. \
+        Write the discussion impersonally ("…하기로 함", "…라는 의견이 있었음"). A \
+        person's name belongs in the minutes only where it was the subject the meeting \
+        talked about, never as the source of a remark.
+        3. Output Markdown, and only the document itself — no preamble or commentary.
         """
         let glossary = Settings.shared.glossaryText
         if !glossary.isEmpty {
@@ -95,6 +99,9 @@ enum LLMRefiner {
             sounds like (or is a plausible mis-recognition of) a glossary term, use the \
             exact glossary spelling. Lines of the form "wrong -> right" map a frequent \
             mis-recognition to the preferred term.
+
+            The glossary is a spelling aid only — it is not a roster. A name appearing \
+            here is no evidence that its bearer attended or spoke.
 
             \(glossary)
             """
