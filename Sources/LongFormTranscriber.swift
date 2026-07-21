@@ -79,8 +79,16 @@ final class LongFormTranscriber {
     /// Silence long enough to end an utterance mid-sentence. Japanese (and
     /// spoken Korean) pause naturally after particles and before final
     /// endings; 0.35 s cut sentences apart there, chopping the trailing
-    /// ending off and feeding fragments to the translator.
-    private let utteranceSilenceGap: TimeInterval = 0.7
+    /// ending off and feeding fragments to the translator. Diagnostics showed
+    /// 0.7 s was still mid-sentence breathing, not a boundary: across 1,300+
+    /// silence-seals, 55 % fired at 0.7 s and 86 % at ≤0.8 s — every one an
+    /// un-punctuated fragment (Korean STT emits terminal punctuation ~2 % of
+    /// the time, so `sentenceDoneSilenceGap` almost never applies and this gap
+    /// governs the stream). Reading each fragment as its own utterance is the
+    /// "chopped, staccato" delivery. 1.0 s keeps a speaker who merely paused to
+    /// breathe on one continuous turn; `cadenceFinalizeAfter` (2.5 s) still
+    /// caps how long an unbroken speaker can starve finalization.
+    private let utteranceSilenceGap: TimeInterval = 1.0
     /// When the hypothesis already ends in sentence-final punctuation the
     /// sentence is really over — seal faster for interpreter responsiveness.
     private let sentenceDoneSilenceGap: TimeInterval = 0.45
