@@ -118,7 +118,16 @@ enum LLMRefiner {
         words; silently correct them from context. Never invent content — attendees, \
         decisions, dates — that the transcript does not support.
         \(roster.isEmpty ? Self.noRosterRule : Self.rosterRule(roster))
-        3. Output Markdown, and only the document itself — no preamble or commentary.
+        3. Some passages may be tagged bilingually: a `[xx] …` line (a foreign-language \
+        original, xx being its language code) immediately followed by a `[ko] …` (or \
+        other main-language) line that is its live interpretation. This marks where a \
+        foreign-language speaker was interpreted during the meeting. Treat each such \
+        pair as ONE contribution — write the minutes in the meeting's main language \
+        drawing the substance from the interpretation, and quote the original inline \
+        only where precision demands it (an exact term, a name, a figure) as \
+        "번역 (원문)". Never render a bilingual passage twice, once per language, and \
+        never leave a foreign-language sentence untranslated in the minutes.
+        4. Output Markdown, and only the document itself — no preamble or commentary.
         """
         let glossary = Settings.shared.glossaryText
         if !glossary.isEmpty {

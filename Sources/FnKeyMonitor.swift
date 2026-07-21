@@ -48,6 +48,19 @@ final class FnKeyMonitor {
     var onLongTriggerDown: (() -> Void)?
     private var longDown = false
 
+    /// Fired on an option+shift double-tap — the meeting translation-overlay
+    /// toggle. Pure ⌥⇧ only (no Ctrl/Cmd), so it never fires as part of a
+    /// larger chord: two "both-held" rising edges within the window below.
+    var onTranslateOverlayToggle: (() -> Void)?
+    /// True while pure ⌥⇧ is held, so only the transition INTO that state
+    /// counts as a tap (a held ⌥⇧ during word-selection is one edge, not many).
+    private var optShiftHeld = false
+    /// Event timestamp (seconds since boot, monotonic) of the last ⌥⇧ tap.
+    private var lastOptShiftTapAt: TimeInterval = 0
+    /// Two taps closer than this are a double-tap. Short enough that an
+    /// incidental ⌥⇧ press during editing rarely repeats inside it.
+    private let overlayDoubleTapWindow: TimeInterval = 0.4
+
     /// Modifier flags we track for chords.
     static let relevantModifiers: NSEvent.ModifierFlags = [.control, .shift, .option, .command]
 
@@ -246,6 +259,28 @@ final class FnKeyMonitor {
                     DispatchQueue.main.async { [weak self] in self?.onLongTriggerDown?() }
                 }
             }
+        }
+
+        detectOverlayDoubleTap(event)
+    }
+
+    /// Detects an option+shift double-tap for the meeting translation overlay.
+    /// Only the rising edge into pure ⌥⇧ (no Ctrl/Cmd) is a tap, so holding
+    /// ⌥⇧ (e.g. word-selection) is a single edge; two edges within
+    /// `overlayDoubleTapWindow` fire the toggle.
+    private func detectOverlayDoubleTap(_ event: NSEvent) {
+        let mods = event.modifierFlags
+        let pure = mods.contains(.option) && mods.contains(.shift)
+            && !mods.contains(.control) && !mods.contains(.command)
+        defer { optShiftHeld = pure }
+        guard pure, !optShiftHeld else { return } // rising edge only
+        let now = event.timestamp
+        if lastOptShiftTapAt > 0, now - lastOptShiftTapAt <= overlayDoubleTapWindow {
+            lastOptShiftTapAt = 0
+            NSLog("MacTranscribe[Fn]: ⌥⇧ double-tap")
+            DispatchQueue.main.async { [weak self] in self?.onTranslateOverlayToggle?() }
+        } else {
+            lastOptShiftTapAt = now
         }
     }
 

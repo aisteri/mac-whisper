@@ -46,6 +46,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private enum LockMode { case meeting, interpreter }
     private var lockMode: LockMode = .meeting
 
+    /// Translation overlay: during a MEETING session the user can toggle live
+    /// interpretation on for a foreign-language speaker (option+shift double-tap
+    /// or the menu). While active, the recognizer listens in the source
+    /// language and the translation pipeline runs; toggling off returns the
+    /// recognizer to the meeting language. The whole meeting is still saved as
+    /// one transcript, with the interpreted stretches marked for bilingual
+    /// minutes. Only for local-STT providers — DeepL Voice bypasses the
+    /// recognizer and can't share it with the meeting.
+    private var translationOverlayActive = false
+    /// The translation pipeline has been configured this session (lazily, on
+    /// the first overlay activation) so repeat toggles don't re-init it.
+    private var overlayInfraReady = false
+    /// True if the overlay was activated at any point this session — gates
+    /// whether a meeting session still produces minutes (it does).
+    private var overlayUsedThisSession = false
+    /// Sealed past language stretches of the current session, assembled across
+    /// overlay toggles: meeting-language stretches verbatim, interpreted
+    /// stretches as `[zh] 원문 / [ko] 번역`. The live stretch (whatever the
+    /// recognizer is producing right now) is appended at save time. Empty when
+    /// the overlay was never used — the session then saves exactly as before.
+    private var sessionTranscript = ""
+
     private let panel = FloatingPanel()
     private let transcriptWindow = TranscriptWindowController()
     private let subtitles = SubtitleOverlay()
@@ -216,9 +238,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // Live Translation is toggled often enough per-session to earn a
         // shortcut here; source/target languages live in Settings ▸ Translation.
-        let interpItem = NSMenuItem(title: "Live Translation", action: #selector(toggleLiveTranslation), keyEquivalent: "")
+        // During a meeting it becomes the overlay switch (option+shift ×2 too),
+        // turning interpretation on for a foreign-language speaker right away.
+        let overlayContext = isLockedRecording && lockMode == .meeting
+        let interpItem = NSMenuItem(
+            title: overlayContext
+                ? (translationOverlayActive ? "통역 오버레이 끄기" : "통역 오버레이 켜기 (⌥⇧×2)")
+                : "Live Translation",
+            action: #selector(toggleLiveTranslation), keyEquivalent: "")
         interpItem.target = self
-        interpItem.image = settings.liveTranslationEnabled ? menuIcon("checkmark") : nil
+        let interpChecked = overlayContext ? translationOverlayActive : settings.liveTranslationEnabled
+        interpItem.image = interpChecked ? menuIcon("checkmark") : nil
         menu.addItem(interpItem)
 
         let windowItem = NSMenuItem(title: "Transcript Window…", action: #selector(openTranscriptWindow), keyEquivalent: "")
@@ -312,6 +342,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             SpeechService.diag("long trigger key -> toggle locked")
             self?.toggleLockHotkey()
         }
+        fnMonitor.onTranslateOverlayToggle = { [weak self] in
+            SpeechService.diag("⌥⇧×2 -> toggle translation overlay")
+            self?.toggleTranslationOverlay()
+        }
         settingsController.fnMonitor = fnMonitor
         settingsController.onTriggerChanged = { [weak self] in
             guard let self else { return }
@@ -359,15 +393,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // normal draggable/resizable window — instead of the floating HUD.
         longForm.onTranscript = { [weak self] text, stableLength in
             guard let self else { return }
-            if self.lockMode == .interpreter {
+            if self.lockMode == .interpreter || self.translationOverlayActive {
                 // The translation engine renders the display; the autosave
-                // still keeps the raw original.
+                // still keeps the raw original. In a meeting with the overlay
+                // active, this is the foreign-language stretch being interpreted.
                 self.translator.feed(text, stableLength: stableLength)
             } else {
                 self.transcriptWindow.updateTranscript(text)
                 self.subtitles.update(fullText: text)
             }
-            self.autosaveLockedTranscript(text)
+            // Overlay-active text is the source language (e.g. Chinese); routing
+            // it into the meeting autosave would mix languages mid-line. Phase 4
+            // seals it as a bilingual segment on toggle instead.
+            if !self.translationOverlayActive {
+                self.autosaveLockedTranscript(text)
+            }
         }
         translator.onDisplay = { [weak self] transcript, caption in
             guard let self else { return }
@@ -414,6 +454,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return self.speechOutput.isSpeaking || !self.caption.grey.isEmpty
         }
         longForm.onFinished = { [weak self] text in self?.handleLockedFinished(text) }
+        longForm.onSegmentBoundary = { [weak self] text, language in
+            self?.sealTranscriptSegment(text, language: language)
+        }
         longForm.onStatus = { [weak self] status in
             self?.transcriptWindow.setStatus(status)
             self?.subtitles.flashStatus(status)
@@ -588,93 +631,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         voiceSession = nil
         gateDrivesCaptions = false
         lockMode = mode
+        translationOverlayActive = false
+        overlayInfraReady = false
+        overlayUsedThisSession = false
+        sessionTranscript = ""
         if mode == .interpreter {
-            translator.reset()
-            translator.onSpeechStreams = nil
-            speechOutput.reset()
-            speechOutput.enabled = settings.speakTranslations
-            speechOutput.duckOthers = settings.duckWhileSpeaking
-            speechOutput.languageTag = SpeechOutput.languageTag(
-                deepl: settings.deeplEnabled ? settings.deeplTargetLang : "",
-                llm: settings.interpreterTargetLanguage)
-            speechOutput.voiceIdentifier = settings.speechVoiceIdentifier
-            // Premium voices load their model on first synthesis; pay that
-            // during session prep, not on the first translation.
-            speechOutput.prewarm()
-            // Duck for the WHOLE session: per-sentence duck/unduck swung
-            // both the original and the voice (which rides the same system
-            // volume) up and down through every gap.
-            if settings.speakTranslations && settings.duckWhileSpeaking {
-                SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
-            }
-            speechGate.reset()
-            // Early speech is DeepL-only, permanently. Two designs tried to
-            // early-speak the Apple path — the raw live translation, then
-            // the local-agreement committed prefix — and both re-read whole
-            // rewritten sentences in production, because the recognizer
-            // hypothesis flips and the re-translation (agreement included)
-            // restarts from scratch. Early speech requires a stream that
-            // grows; the Apple path's doesn't. Not a tuning problem.
-            speechGate.earlySpeech = settings.earlySpeechEnabled
-                && !settings.appleTranslationEnabled
-            caption.reset(); lastSettledCount = 0
-            // The gate drives speech AND captions for the stream-shaped
-            // providers (DeepL Voice, Apple); the LLM path keeps the legacy
-            // per-utterance hand-off and grey/white captions.
-            gateDrivesCaptions = settings.appleTranslationEnabled || settings.deeplVoiceEnabled
-            translator.appleTranslator = nil
-            if settings.appleTranslationEnabled {
-                // On-device path: by construction NO network request is made
-                // for translation — no LLM warm-up, no DeepL session, nothing.
-                translator.useDeepL = false
-                translator.targetLanguage = settings.interpreterTargetLanguage
-                translator.sourceLanguage = settings.interpreterSourceLanguage
-                translator.appleTranslator = appleTranslator
-                // Same gate as DeepL Voice: clause-level early speech from
-                // the live line, ledger dedup, playback-synced captions.
-                translator.onSpeechStreams = { [weak self] concluded, stable, preview in
-                    guard let self else { return }
-                    self.speechGate.update(concludedStream: concluded, tentative: stable)
-                    // Grey = the gate's unspoken tail plus the translation
-                    // that hasn't even reached agreement yet (stable is a
-                    // prefix of preview, so this concatenation never
-                    // duplicates text).
-                    let beyond = String(preview.dropFirst(stable.count))
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.caption.grey = [self.speechGate.pendingText, beyond]
-                        .filter { !$0.isEmpty }.joined(separator: " ")
-                    self.renderGateCaption()
-                }
-                let source = AppleTranslator.localeLanguage(forPrompt: settings.interpreterSourceLanguage)
-                let target = AppleTranslator.localeLanguage(forPrompt: settings.interpreterTargetLanguage)
-                    ?? Locale.Language(identifier: "en")
-                appleTranslator.start(source: source, target: target) { [weak self] ready in
-                    guard let self, !ready else { return }
-                    self.transcriptWindow.setStatus("On-device translation unavailable for this pair — captions show the original")
-                }
-            } else if settings.deeplEnabled && settings.deeplConfigured && settings.deeplVoiceEnabled {
-                // DeepL Voice streaming: audio goes straight to DeepL, which
-                // does its own ASR + segmentation + translation. The local
-                // recognizer never starts, so none of its fragment/ending
-                // problems apply.
-                voiceSourceBase = ""; voiceTargetBase = ""
-                voiceSourceFull = ""; voiceTargetFull = ""
-                voiceRestarts = 0
-                longForm.bypassAnalyzer = true
-                startVoiceSession()
-            } else if settings.deeplEnabled && settings.deeplConfigured {
-                translator.useDeepL = true
-                translator.deeplAPIKey = settings.deeplAPIKey
-                translator.deeplTargetLang = settings.deeplTargetLang
-                translator.deeplSourceLang = settings.deeplSourceLang
-            } else {
-                translator.useDeepL = false
-                translator.targetLanguage = settings.interpreterTargetLanguage
-                translator.sourceLanguage = settings.interpreterSourceLanguage
-                // Pre-warm the LLM path (token refresh, instructions cache, TLS)
-                // so the first real utterance doesn't pay for any of it.
-                LLMRefiner.warmUpTranslation(to: settings.interpreterTargetLanguage)
-            }
+            configureInterpreterPipeline(activate: true)
         }
         // Interpreter captions run taller (three lines of continuity: a
         // translation trails its speech, so the surrounding lines keep it
@@ -767,6 +729,212 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         rebuildMenu()
     }
 
+    /// Configures the translation pipeline (provider, gate, TTS voice, captions)
+    /// for a session that will interpret. `activate` = true for a full
+    /// interpreter session — speech output and session-scoped ducking turn on
+    /// now, and DeepL Voice is allowed. `activate` = false merely PREPARES the
+    /// pipeline for a meeting's translation overlay: everything is wired but the
+    /// voice stays muted and no ducking starts until the overlay is toggled on
+    /// (see `enableTranslationOverlay`). The overlay never uses DeepL Voice
+    /// (that provider bypasses the shared recognizer), so with `activate=false`
+    /// the DeepL-Voice branch is skipped and the caller must have excluded it.
+    private func configureInterpreterPipeline(activate: Bool) {
+        translator.reset()
+        translator.onSpeechStreams = nil
+        speechOutput.reset()
+        speechOutput.enabled = activate && settings.speakTranslations
+        speechOutput.duckOthers = settings.duckWhileSpeaking
+        speechOutput.languageTag = SpeechOutput.languageTag(
+            deepl: settings.deeplEnabled ? settings.deeplTargetLang : "",
+            llm: settings.interpreterTargetLanguage)
+        speechOutput.voiceIdentifier = settings.speechVoiceIdentifier
+        // Premium voices load their model on first synthesis; pay that
+        // during session prep, not on the first translation.
+        speechOutput.prewarm()
+        // Duck for the WHOLE session: per-sentence duck/unduck swung both the
+        // original and the voice (which rides the same system volume) up and
+        // down through every gap. In overlay mode, ducking is deferred to the
+        // toggle so the meeting plays at full volume until interpretation runs.
+        if activate && settings.speakTranslations && settings.duckWhileSpeaking {
+            SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
+        }
+        speechGate.reset()
+        // Early speech is DeepL-only, permanently. Two designs tried to
+        // early-speak the Apple path — the raw live translation, then the
+        // local-agreement committed prefix — and both re-read whole rewritten
+        // sentences in production, because the recognizer hypothesis flips and
+        // the re-translation (agreement included) restarts from scratch. Early
+        // speech requires a stream that grows; the Apple path's doesn't.
+        speechGate.earlySpeech = settings.earlySpeechEnabled
+            && !settings.appleTranslationEnabled
+        caption.reset(); lastSettledCount = 0
+        // The gate drives speech AND captions for the stream-shaped providers
+        // (DeepL Voice, Apple); the LLM path keeps the legacy per-utterance
+        // hand-off and grey/white captions.
+        gateDrivesCaptions = settings.appleTranslationEnabled
+            || (activate && settings.deeplVoiceEnabled)
+        translator.appleTranslator = nil
+        if settings.appleTranslationEnabled {
+            // On-device path: by construction NO network request is made for
+            // translation — no LLM warm-up, no DeepL session, nothing.
+            translator.useDeepL = false
+            translator.targetLanguage = settings.interpreterTargetLanguage
+            translator.sourceLanguage = settings.interpreterSourceLanguage
+            translator.appleTranslator = appleTranslator
+            // Same gate as DeepL Voice: clause-level early speech from the live
+            // line, ledger dedup, playback-synced captions.
+            translator.onSpeechStreams = { [weak self] concluded, stable, preview in
+                guard let self else { return }
+                self.speechGate.update(concludedStream: concluded, tentative: stable)
+                // Grey = the gate's unspoken tail plus the translation that
+                // hasn't even reached agreement yet (stable is a prefix of
+                // preview, so this concatenation never duplicates text).
+                let beyond = String(preview.dropFirst(stable.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.caption.grey = [self.speechGate.pendingText, beyond]
+                    .filter { !$0.isEmpty }.joined(separator: " ")
+                self.renderGateCaption()
+            }
+            let source = AppleTranslator.localeLanguage(forPrompt: settings.interpreterSourceLanguage)
+            let target = AppleTranslator.localeLanguage(forPrompt: settings.interpreterTargetLanguage)
+                ?? Locale.Language(identifier: "en")
+            appleTranslator.start(source: source, target: target) { [weak self] ready in
+                guard let self, !ready else { return }
+                self.transcriptWindow.setStatus("On-device translation unavailable for this pair — captions show the original")
+            }
+        } else if activate && settings.deeplEnabled && settings.deeplConfigured && settings.deeplVoiceEnabled {
+            // DeepL Voice streaming: audio goes straight to DeepL, which does
+            // its own ASR + segmentation + translation. The local recognizer
+            // never starts, so none of its fragment/ending problems apply.
+            voiceSourceBase = ""; voiceTargetBase = ""
+            voiceSourceFull = ""; voiceTargetFull = ""
+            voiceRestarts = 0
+            longForm.bypassAnalyzer = true
+            startVoiceSession()
+        } else if settings.deeplEnabled && settings.deeplConfigured {
+            translator.useDeepL = true
+            translator.deeplAPIKey = settings.deeplAPIKey
+            translator.deeplTargetLang = settings.deeplTargetLang
+            translator.deeplSourceLang = settings.deeplSourceLang
+        } else {
+            translator.useDeepL = false
+            translator.targetLanguage = settings.interpreterTargetLanguage
+            translator.sourceLanguage = settings.interpreterSourceLanguage
+            // Pre-warm the LLM path (token refresh, instructions cache, TLS) so
+            // the first real utterance doesn't pay for any of it.
+            LLMRefiner.warmUpTranslation(to: settings.interpreterTargetLanguage)
+        }
+    }
+
+    /// Whether a translation overlay can run in the CURRENT meeting session:
+    /// only meeting mode, only local-STT providers (DeepL Voice bypasses the
+    /// shared recognizer), and only when a concrete source language the
+    /// recognizer can hear is pinned (so there is something to switch TO).
+    private var overlayAvailable: Bool {
+        guard isLockedRecording, lockMode == .meeting else { return false }
+        guard !settings.deeplVoiceEnabled else { return false }
+        let providerReady = settings.appleTranslationEnabled
+            || (settings.deeplEnabled && settings.deeplConfigured)
+            || (!settings.deeplEnabled && settings.llmConfigured)
+        guard providerReady else { return false }
+        // The overlay switches the recognizer to the source language, so that
+        // language must be a concrete, recognizable one (not auto-detect).
+        return RecognitionLanguage(sourceLanguage: settings.activeInterpreterSource) != nil
+    }
+
+    /// Toggles the meeting translation overlay. No-op (with feedback) when the
+    /// current session can't host one.
+    private func toggleTranslationOverlay() {
+        guard isLockedRecording, lockMode == .meeting else {
+            if isLockedRecording {
+                subtitles.flashStatus("⚠︎ 통역 오버레이는 회의록 모드에서만 됩니다")
+            }
+            return
+        }
+        guard overlayAvailable else {
+            let why = settings.deeplVoiceEnabled
+                ? "DeepL Voice는 자체 언어 감지 — 오버레이가 필요 없습니다"
+                : "출발 언어를 인식 가능한 언어(영·한·일·중)로 지정하세요"
+            subtitles.flashStatus("⚠︎ 통역 오버레이 불가 — \(why)")
+            SpeechService.diag("overlay toggle refused: \(why)")
+            return
+        }
+        if translationOverlayActive { disableTranslationOverlay() }
+        else { enableTranslationOverlay() }
+    }
+
+    private func enableTranslationOverlay() {
+        // Lazily wire the translation pipeline the first time (appleTranslator
+        // start, LLM warm-up, TTS prewarm) — dormant until this point so a
+        // meeting that never needs interpretation pays nothing.
+        if !overlayInfraReady {
+            configureInterpreterPipeline(activate: false)
+            overlayInfraReady = true
+        }
+        translationOverlayActive = true
+        overlayUsedThisSession = true
+        // Switch the recognizer to the source language; the segment boundary
+        // callback seals the Korean stretch just spoken (Phase 4 consumes it).
+        longForm.switchLanguage(to: settings.interpreterRecognitionLanguage)
+        speechOutput.enabled = settings.speakTranslations
+        if settings.speakTranslations && settings.duckWhileSpeaking {
+            SystemAudio.duckOutput(to: SpeechOutput.duckFactor)
+        }
+        subtitles.maxLines = 3
+        let src = settings.activeInterpreterSource
+        subtitles.flashStatus("🎙 통역 오버레이 ON — \(src) → \(settings.interpreterTargetLanguage)")
+        SpeechService.diag("overlay ON src=\(src) recognizer=\(settings.interpreterRecognitionLanguage.rawValue)")
+        rebuildMenu()
+    }
+
+    private func disableTranslationOverlay() {
+        translationOverlayActive = false
+        // Return the recognizer to the meeting language; the boundary callback
+        // seals the interpreted stretch (source+translation) for the minutes.
+        longForm.switchLanguage(to: settings.language)
+        speechOutput.enabled = false
+        SystemAudio.unduckOutput()
+        subtitles.maxLines = 2
+        subtitles.flashStatus("⏹ 통역 오버레이 OFF — 회의록 계속")
+        SpeechService.diag("overlay OFF -> recognizer=\(settings.language.rawValue)")
+        rebuildMenu()
+    }
+
+    /// A language stretch just ended (overlay toggled, or `switchLanguage`
+    /// fired). A meeting-language stretch is appended verbatim; an interpreted
+    /// stretch is paired with its translation for bilingual minutes.
+    private func sealTranscriptSegment(_ text: String, language: RecognitionLanguage) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if language == settings.language {
+            if !trimmed.isEmpty { appendSessionTranscript(trimmed) }
+        } else {
+            let block = bilingualBlock(pairs: translator.drainBilingualSegments(),
+                                       sourceFallback: trimmed)
+            if !block.isEmpty { appendSessionTranscript(block) }
+        }
+    }
+
+    private func appendSessionTranscript(_ block: String) {
+        sessionTranscript += sessionTranscript.isEmpty ? block : "\n" + block
+    }
+
+    /// Formats an interpreted stretch as tagged bilingual lines the minutes
+    /// prompt understands: `[zh] 원문` followed by `[ko] 번역` per utterance.
+    /// Falls back to source-only when a translation never landed.
+    private func bilingualBlock(pairs: [(source: String, translation: String)],
+                                sourceFallback: String) -> String {
+        let srcTag = String(settings.interpreterRecognitionLanguage.rawValue.prefix(2))
+        let tgtTag = String(settings.language.rawValue.prefix(2))
+        guard !pairs.isEmpty else {
+            return sourceFallback.isEmpty ? "" : "[\(srcTag)] \(sourceFallback)"
+        }
+        return pairs.map { p in
+            p.translation.isEmpty
+                ? "[\(srcTag)] \(p.source)"
+                : "[\(srcTag)] \(p.source)\n[\(tgtTag)] \(p.translation)"
+        }.joined(separator: "\n")
+    }
+
     private func stopLockedRecording() {
         guard isLockedRecording, !lockStopping else { return }
         lockStopping = true
@@ -783,6 +951,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard isLockedRecording else { return }
         isLockedRecording = false
         lockStopping = false
+        // A session can end with the overlay still on; capture that (the final
+        // stretch then needs bilingual pairing) before clearing its state. The
+        // session-scoped unduck below covers its ducking.
+        let wasOverlayActive = translationOverlayActive
+        translationOverlayActive = false
+        overlayInfraReady = false
         // Keep the sleep-prevention activity alive: meeting notes and
         // transcript refinement run after the recording ends, and closing
         // the lid mid-generation kills the network request. The activity
@@ -803,6 +977,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             longForm.externalAudioSink = nil
             longForm.bypassAnalyzer = false
             finalText = voiceSourceFull
+        }
+        // Overlay session: stitch the sealed past stretches to this final one.
+        // If the session ended mid-interpretation, the last stretch is the
+        // source language and needs bilingual pairing; otherwise it's plain
+        // meeting-language text.
+        if overlayUsedThisSession {
+            let tail = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lastBlock = wasOverlayActive
+                ? bilingualBlock(pairs: translator.drainBilingualSegments(), sourceFallback: tail)
+                : tail
+            finalText = [sessionTranscript, lastBlock].filter { !$0.isEmpty }.joined(separator: "\n")
         }
         postRecordingTasks = 0
         finishLockedSession(with: finalText)
@@ -1117,8 +1302,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let now = Date()
         guard now.timeIntervalSince(lastAutosaveAt) >= 2 else { return }
         lastAutosaveAt = now
+        // Prepend any sealed past stretches so a crash mid-overlay still
+        // recovers the whole meeting, not just the live stretch. (Overlay-active
+        // text isn't routed here — see onTranscript — so `text` is always a
+        // meeting-language stretch.)
+        let full = sessionTranscript.isEmpty ? text : sessionTranscript + "\n" + text
         autosaveQueue.async {
-            try? text.write(to: url, atomically: true, encoding: .utf8)
+            try? full.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
@@ -1367,6 +1557,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Live Translation keeps a menu-bar shortcut. Enabling it needs the Engine
     /// configured, so send the user to Settings when it isn't.
     @objc private func toggleLiveTranslation() {
+        // During a running meeting session this item drives the live overlay —
+        // turning interpretation on the instant it's clicked — instead of the
+        // setting, which only takes effect at the next session start.
+        if isLockedRecording && lockMode == .meeting {
+            toggleTranslationOverlay()
+            return
+        }
         settings.liveTranslationEnabled.toggle()
         if settings.liveTranslationEnabled && !settings.llmConfigured {
             openSettings()

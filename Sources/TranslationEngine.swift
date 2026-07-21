@@ -221,6 +221,22 @@ final class TranslationEngine {
         qualityRequest = nil
     }
 
+    /// Drains the [source, translation] pairs accumulated so far — the
+    /// interpreted stretch a meeting's translation overlay just ended — for
+    /// bilingual minutes, then resets so the next stretch starts clean. An
+    /// utterance whose translation is still in flight falls back to an empty
+    /// translation (the caller keeps the source).
+    func drainBilingualSegments() -> [(source: String, translation: String)] {
+        let pairs: [(source: String, translation: String)] = utterances.compactMap { u in
+            let src = u.source.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !src.isEmpty else { return nil }
+            let trans = (u.translation.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return (source: src, translation: trans)
+        }
+        reset()
+        return pairs
+    }
+
     // MARK: - Input
 
     /// Feeds the transcriber's full accumulated text — one utterance per line,

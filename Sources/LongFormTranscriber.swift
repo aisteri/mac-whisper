@@ -25,6 +25,10 @@ final class LongFormTranscriber {
     var onTranscript: ((_ text: String, _ stableLength: Int) -> Void)?
     /// Final transcript once the session fully drains, on main. Fires exactly once.
     var onFinished: ((String) -> Void)?
+    /// Fired just before a live language switch (`switchLanguage`), carrying the
+    /// transcript that accumulated in the OUTGOING language so the caller can
+    /// seal that segment before the recognizer restarts in the new locale. On main.
+    var onSegmentBoundary: ((_ text: String, _ language: RecognitionLanguage) -> Void)?
     /// When set, every captured buffer is also written to this file (AAC).
     var audioBackupURL: URL?
 
@@ -453,6 +457,57 @@ final class LongFormTranscriber {
             self.stateLock.lock()
             self.pipelineRestartInFlight = false
             self.audioStartedAt = Date() // re-arm the timeout for a second try
+            self.stateLock.unlock()
+        }
+    }
+
+    /// Switches the recognizer's language mid-session WITHOUT interrupting
+    /// capture — the same in-place analyzer swap the mute watchdog performs
+    /// (`rebuildMutePipeline`), plus the language reassignment and segment
+    /// reset that make it a *language* switch rather than a restart. The
+    /// outgoing language's accumulated transcript is sealed and handed to
+    /// `onSegmentBoundary`, then cleared so the two languages never bleed
+    /// together in one turn. No-op in streaming/bypass mode (no local
+    /// recognizer) or when the language is unchanged. Call on the main thread
+    /// (`gen` is only touched there).
+    func switchLanguage(to newLanguage: RecognitionLanguage) {
+        guard isRunning, !bypassAnalyzer else { return }
+        stateLock.lock()
+        guard newLanguage != sessionLanguage else { stateLock.unlock(); return }
+        let outgoing = sessionLanguage
+        let segment = (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
+        gen &+= 1
+        let myGen = gen
+        finalizedText = ""
+        volatileText = ""
+        sessionLanguage = newLanguage
+        pipelineRestartInFlight = true // hold the mute watchdog off during the swap
+        let oldBuilder = inputBuilder
+        inputBuilder = nil // the tap drops buffers until the new pipeline lands
+        let oldAnalyzer = analyzer
+        analyzer = nil
+        resultsTask?.cancel()
+        resultsTask = nil
+        stateLock.unlock()
+        lastFinalizedAudioEnd = 0 // new language starts a fresh audio timeline
+        oldBuilder?.finish()
+        SpeechService.diag("longform switchLanguage \(outgoing.rawValue) -> \(newLanguage.rawValue) sealed=\(segment.count)")
+        if !segment.isEmpty {
+            DispatchQueue.main.async { [weak self] in self?.onSegmentBoundary?(segment, outgoing) }
+        }
+        Task { [weak self] in
+            try? await oldAnalyzer?.finalizeAndFinishThroughEndOfInput()
+            guard let self else { return }
+            do {
+                let ok = try await self.setupAnalyzerPipeline(language: newLanguage, gen: myGen)
+                SpeechService.diag("longform switchLanguage rebuild \(ok ? "OK" : "stale")")
+            } catch {
+                SpeechService.diag("longform switchLanguage rebuild FAILED: \(error)")
+            }
+            self.stateLock.lock()
+            self.pipelineRestartInFlight = false
+            self.audioStartedAt = Date()      // re-arm the mute-timeout baseline
+            self.lastResultAt = nil           // and its result baseline for the new language
             self.stateLock.unlock()
         }
     }
