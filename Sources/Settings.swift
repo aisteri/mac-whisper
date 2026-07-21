@@ -20,6 +20,22 @@ enum RecognitionLanguage: String, CaseIterable {
 
     var locale: Locale { Locale(identifier: rawValue) }
 
+    /// The recognizer that must run to translate FROM this pinned source
+    /// language. Accepts both DeepL codes ("JA") and LLM prompt names
+    /// ("Japanese"). Returns nil for auto-detect, or for a language DeepL can
+    /// translate but this app has no recognizer for (German, French, …) — the
+    /// caller must surface that rather than silently mishearing everything.
+    init?(sourceLanguage: String) {
+        switch sourceLanguage {
+        case "EN", "English": self = .english
+        case "KO", "Korean": self = .korean
+        case "JA", "Japanese": self = .japanese
+        case "ZH", "Simplified Chinese": self = .simplifiedChinese
+        case "Traditional Chinese": self = .traditionalChinese
+        default: return nil
+        }
+    }
+
     /// "Listening…" placeholder shown in the HUD, localized to this language.
     var listeningPlaceholder: String {
         switch self {
@@ -323,6 +339,31 @@ final class Settings {
     var interpreterSourceLanguage: String {
         get { defaults.string(forKey: Keys.interpreterSource) ?? TranslationLanguage.autoSource }
         set { defaults.set(newValue, forKey: Keys.interpreterSource) }
+    }
+
+    /// The source language pinned for the ACTIVE translation provider — a
+    /// DeepL code when DeepL is selected, an LLM prompt name otherwise. Empty
+    /// or "Auto" both mean auto-detect.
+    var activeInterpreterSource: String {
+        deeplEnabled ? deeplSourceLang : interpreterSourceLanguage
+    }
+
+    /// The recognizer a live-translation session must listen in. A pinned
+    /// source language IS the spoken language, so it decides the recognizer;
+    /// auto-detect (or a source with no recognizer) falls back to the
+    /// standalone recognition language. Speech-to-text can't auto-detect, so
+    /// this is always a concrete locale.
+    var interpreterRecognitionLanguage: RecognitionLanguage {
+        RecognitionLanguage(sourceLanguage: activeInterpreterSource) ?? language
+    }
+
+    /// True when a specific source language is pinned that no recognizer can
+    /// hear (e.g. DeepL German) — the session would mistranscribe everything,
+    /// so the caller should refuse to start and say why.
+    var interpreterSourceUnsupportedBySTT: Bool {
+        let source = activeInterpreterSource
+        guard !source.isEmpty, source != TranslationLanguage.autoSource else { return false }
+        return RecognitionLanguage(sourceLanguage: source) == nil
     }
 
     /// Generate structured meeting notes with the LLM after a locked

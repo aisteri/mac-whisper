@@ -451,6 +451,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         applyProviderVisibility()
         applyTranslationVisibility()
         rebuildTranslationLanguages()
+        // Reflect (and reconcile) the source↔recognizer relationship in the
+        // status line the moment the window opens, not only after an edit.
+        syncRecognitionToSource()
         refreshAPIKeyStatus()
         refreshGlossaryStatus()
     }
@@ -527,32 +530,39 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         onSettingsChanged?()
     }
 
-    /// Speech-to-text must listen in the language being SPOKEN — a Korean
-    /// recognizer turns Japanese speech into garbage before the translator
-    /// ever sees it. Pinning a source drags the recognition language along.
-    private static let sourceToRecognition: [String: RecognitionLanguage] = [
-        // DeepL codes
-        "EN": .english, "KO": .korean, "JA": .japanese, "ZH": .simplifiedChinese,
-        // LLM prompt names
-        "English": .english, "Korean": .korean, "Japanese": .japanese,
-        "Simplified Chinese": .simplifiedChinese, "Traditional Chinese": .traditionalChinese,
-    ]
-
     @objc private func sourceLangChanged() {
         let s = Settings.shared
         let value = represented(sourceLangPopup)
         if s.deeplEnabled { s.deeplSourceLang = value } else { s.interpreterSourceLanguage = value }
-        if let recognition = Self.sourceToRecognition[value], s.language != recognition {
-            s.language = recognition
-            selectByRepresented(recognitionPopup, recognition.rawValue)
-            transStatusLabel.textColor = .secondaryLabelColor
-            transStatusLabel.stringValue = "Recognition language → \(recognition.displayName) (전사는 발화 언어로 들어야 합니다)"
-        } else if !value.isEmpty, value != TranslationLanguage.autoSource,
-                  Self.sourceToRecognition[value] == nil {
-            transStatusLabel.textColor = .systemOrange
-            transStatusLabel.stringValue = "Speech recognition does not support this source language."
-        }
+        syncRecognitionToSource()
         onSettingsChanged?()
+    }
+
+    /// Keeps speech-to-text listening in the language being SPOKEN — a Korean
+    /// recognizer turns Japanese speech into garbage before the translator
+    /// ever sees it. The pinned source IS that language, so it drives the
+    /// recognizer: a concrete source pins it to match (the user never has to
+    /// set the General-tab language too); auto-detect leaves it to the General
+    /// setting, since STT cannot auto-detect; a source with no recognizer
+    /// (DeepL German, …) warns instead of silently mishearing. Also called on
+    /// provider switch, where the active source field changes underfoot.
+    private func syncRecognitionToSource() {
+        let s = Settings.shared
+        let value = s.activeInterpreterSource
+        if let recognition = RecognitionLanguage(sourceLanguage: value) {
+            if s.language != recognition {
+                s.language = recognition
+                selectByRepresented(recognitionPopup, recognition.rawValue)
+            }
+            transStatusLabel.textColor = .secondaryLabelColor
+            transStatusLabel.stringValue = "발화 언어 → \(recognition.displayName) (출발 언어를 따라갑니다)"
+        } else if value.isEmpty || value == TranslationLanguage.autoSource {
+            transStatusLabel.textColor = .secondaryLabelColor
+            transStatusLabel.stringValue = "자동 감지 — 발화 언어는 General 탭 설정(\(s.language.displayName))으로 듣습니다."
+        } else {
+            transStatusLabel.textColor = .systemOrange
+            transStatusLabel.stringValue = "‘\(value)’은(는) 음성 인식이 지원하지 않는 출발 언어입니다."
+        }
     }
 
     @objc private func targetLangChanged() {
@@ -961,6 +971,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         Settings.shared.translationProvider = represented(transProviderPopup)
         applyTranslationVisibility()
         rebuildTranslationLanguages()
+        // The active source field just changed (DeepL code vs LLM name), so
+        // the recognizer must be re-synced to whatever the new provider pins.
+        syncRecognitionToSource()
         onSettingsChanged?()
     }
 

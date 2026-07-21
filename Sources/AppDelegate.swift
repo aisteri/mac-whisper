@@ -568,6 +568,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             || (!settings.deeplEnabled && settings.llmConfigured)
         let translationReady = settings.liveTranslationEnabled && providerReady
         let mode: LockMode = translationReady ? .interpreter : .meeting
+        // A pinned source the local recognizer can't hear (DeepL offers
+        // German, French, … with no matching recognizer) would mistranscribe
+        // every word before translation even sees it. DeepL Voice does its
+        // own ASR, so it is exempt. Refuse rather than produce garbage.
+        if mode == .interpreter, !settings.deeplVoiceEnabled,
+           settings.interpreterSourceUnsupportedBySTT {
+            NSSound(named: "Basso")?.play()
+            let src = settings.activeInterpreterSource
+            transcriptWindow.setStatus("‘\(src)’은(는) 음성 인식이 지원하지 않는 출발 언어입니다 — 인식 가능한 언어(영·한·일·중)를 고르거나 자동 감지를 쓰세요.")
+            subtitles.flashStatus("⚠︎ 출발 언어 ‘\(src)’ 음성 인식 미지원")
+            SpeechService.diag("interpreter refused: source '\(src)' has no recognizer")
+            return
+        }
         // Clear any streaming-mode residue from the previous session; the
         // voice branch below re-arms it when applicable.
         longForm.bypassAnalyzer = false
@@ -741,7 +754,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         subtitles.flashStatus(mode == .interpreter
             ? "● 통역 시작 → \(targetName)"
             : "● 녹음 시작")
-        longForm.start(language: settings.language)
+        // In interpreter mode the pinned source language IS the spoken
+        // language, so it decides the recognizer (auto-detect falls back to
+        // the standalone recognition setting). This is the single point that
+        // guarantees STT and translation agree, independent of the order the
+        // user touched the settings popups. Meeting mode has no source, so it
+        // uses the recognition setting directly.
+        let sttLanguage = mode == .interpreter
+            ? settings.interpreterRecognitionLanguage
+            : settings.language
+        longForm.start(language: sttLanguage)
         rebuildMenu()
     }
 
