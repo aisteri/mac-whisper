@@ -283,8 +283,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Reflect the locked-recording state in the menu-bar icon so a running
         // capture is visible even with no HUD and the window closed.
         if let button = statusItem.button {
-            let symbol = isLockedRecording ? "record.circle"
-                : postRecordingTasks > 0 ? "hourglass" : "mic.fill"
+            // The translation overlay takes precedence over the plain recording
+            // dot so an active interpretation is visible at a glance.
+            let symbol: String
+            if translationOverlayActive { symbol = "character.bubble.fill" }
+            else if isLockedRecording { symbol = "record.circle" }
+            else if postRecordingTasks > 0 { symbol = "hourglass" }
+            else { symbol = "mic.fill" }
             button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Mac Transcribe")
             button.image?.isTemplate = true
         }
@@ -847,15 +852,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func toggleTranslationOverlay() {
         guard isLockedRecording, lockMode == .meeting else {
             if isLockedRecording {
-                subtitles.flashStatus("⚠︎ 통역 오버레이는 회의록 모드에서만 됩니다")
+                showTrayBubble("⚠︎ 통역은 회의록 모드에서만 됩니다")
             }
             return
         }
         guard overlayAvailable else {
             let why = settings.deeplVoiceEnabled
-                ? "DeepL Voice는 자체 언어 감지 — 오버레이가 필요 없습니다"
-                : "출발 언어를 인식 가능한 언어(영·한·일·중)로 지정하세요"
-            subtitles.flashStatus("⚠︎ 통역 오버레이 불가 — \(why)")
+                ? "DeepL Voice는 자체 언어 감지 — 오버레이 불필요"
+                : "출발 언어를 인식 가능한 언어로 지정하세요"
+            showTrayBubble("⚠︎ 통역 불가 — \(why)")
             SpeechService.diag("overlay toggle refused: \(why)")
             return
         }
@@ -882,7 +887,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         subtitles.maxLines = 3
         let src = settings.activeInterpreterSource
-        subtitles.flashStatus("🎙 통역 오버레이 ON — \(src) → \(settings.interpreterTargetLanguage)")
+        showTrayBubble("🎙 통역 ON — \(src) → \(settings.interpreterTargetLanguage)")
         SpeechService.diag("overlay ON src=\(src) recognizer=\(settings.interpreterRecognitionLanguage.rawValue)")
         rebuildMenu()
     }
@@ -895,9 +900,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         speechOutput.enabled = false
         SystemAudio.unduckOutput()
         subtitles.maxLines = 2
-        subtitles.flashStatus("⏹ 통역 오버레이 OFF — 회의록 계속")
+        showTrayBubble("⏹ 통역 OFF — 회의록 계속")
         SpeechService.diag("overlay OFF -> recognizer=\(settings.language.rawValue)")
         rebuildMenu()
+    }
+
+    /// Transient popover anchored under the menu-bar icon, for unobtrusive
+    /// overlay-toggle feedback that stays out of the live captions.
+    private var trayBubble: NSPopover?
+
+    /// Shows a short-lived bubble under the tray icon and auto-dismisses it.
+    /// Used for overlay on/off so the feedback never lands in the subtitles.
+    private func showTrayBubble(_ text: String) {
+        guard let button = statusItem.button else { return }
+        trayBubble?.close()
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.alignment = .center
+        label.sizeToFit()
+        let pad = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        let vc = NSViewController()
+        let container = NSView(frame: NSRect(
+            x: 0, y: 0,
+            width: label.frame.width + pad.left + pad.right,
+            height: label.frame.height + pad.top + pad.bottom))
+        label.setFrameOrigin(NSPoint(x: pad.left, y: pad.bottom))
+        container.addSubview(label)
+        vc.view = container
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        pop.contentSize = container.frame.size
+        pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        trayBubble = pop
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak pop] in pop?.close() }
     }
 
     /// A language stretch just ended (overlay toggled, or `switchLanguage`
