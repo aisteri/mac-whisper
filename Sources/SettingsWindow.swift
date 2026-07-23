@@ -538,27 +538,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         onSettingsChanged?()
     }
 
-    /// Keeps speech-to-text listening in the language being SPOKEN — a Korean
-    /// recognizer turns Japanese speech into garbage before the translator
-    /// ever sees it. The pinned source IS that language, so it drives the
-    /// recognizer: a concrete source pins it to match (the user never has to
-    /// set the General-tab language too); auto-detect leaves it to the General
-    /// setting, since STT cannot auto-detect; a source with no recognizer
-    /// (DeepL German, …) warns instead of silently mishearing. Also called on
-    /// provider switch, where the active source field changes underfoot.
+    /// Reflects, in the status line only, which recognizer a LIVE-TRANSLATION
+    /// session will listen in for the pinned source language. It must NOT touch
+    /// the General-tab recognition language: that one drives plain transcription
+    /// and meeting recording, and overwriting it here kept resetting meeting
+    /// recordings to the foreign source language (e.g. Chinese) every time the
+    /// settings window opened. The two are independent by design — a translation
+    /// session derives its recognizer from the source at session start
+    /// (`Settings.interpreterRecognitionLanguage`), so the user never has to set
+    /// the General language too, yet transcription keeps its own. Called on
+    /// source edit and provider switch.
     private func syncRecognitionToSource() {
         let s = Settings.shared
         let value = s.activeInterpreterSource
         if let recognition = RecognitionLanguage(sourceLanguage: value) {
-            if s.language != recognition {
-                s.language = recognition
-                selectByRepresented(recognitionPopup, recognition.rawValue)
-            }
             transStatusLabel.textColor = .secondaryLabelColor
-            transStatusLabel.stringValue = "발화 언어 → \(recognition.displayName) (출발 언어를 따라갑니다)"
+            transStatusLabel.stringValue = "통역 시 \(recognition.displayName)로 인식합니다 (General 발화 언어와 별개)."
         } else if value.isEmpty || value == TranslationLanguage.autoSource {
             transStatusLabel.textColor = .secondaryLabelColor
-            transStatusLabel.stringValue = "자동 감지 — 발화 언어는 General 탭 설정(\(s.language.displayName))으로 듣습니다."
+            transStatusLabel.stringValue = "자동 감지 — 통역은 General 발화 언어(\(s.language.displayName))로 인식합니다."
         } else {
             transStatusLabel.textColor = .systemOrange
             transStatusLabel.stringValue = "‘\(value)’은(는) 음성 인식이 지원하지 않는 출발 언어입니다."
