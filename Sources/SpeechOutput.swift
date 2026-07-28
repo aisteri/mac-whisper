@@ -79,8 +79,12 @@ final class SpeechOutput {
     private let baseRateMultiplier: Double = 1.1
     private let maxRateMultiplier: Double = 1.35
     /// Pending playback (seconds) where the rate starts climbing / tops out.
+    /// Topping out at 8 s meant a fast speaker stayed behind for the whole
+    /// climb while the backlog piled up; 4 s reaches the (unchanged) 1.35 cap
+    /// sooner so the voice starts catching up earlier, without ever exceeding
+    /// the rate the user already found to be the fast limit.
     private let rateRampStart: Double = 1.0
-    private let rateRampEnd: Double = 8.0
+    private let rateRampEnd: Double = 4.0
 
     /// How long an idle voice waits for more shards before speaking an
     /// unterminated fragment. A slow speaker produces small shards with real

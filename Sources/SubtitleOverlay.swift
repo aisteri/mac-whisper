@@ -330,15 +330,6 @@ final class SubtitleOverlay {
 
         let textWidth = karaokeTextWidth()
         let ns = full as NSString
-        // Anchor the visible window on the SETTLED stream only: settled is
-        // append-only, so the window moves in whole-line steps and the
-        // yellow/white text never shifts. Anchoring on the full text let
-        // every grey rewrite change the line count and drag the settled
-        // words around (observed: "already-yellow text jumping/vanishing").
-        // The grey tail flows after the window and may clip at the box
-        // bottom — fine, it hardens into the stable window as it settles.
-        let starts = karaokeLineStarts(settled, width: textWidth)
-        let visibleStart = starts.count >= 2 ? starts[starts.count - 2] : 0
 
         // Boundaries in UTF-16, global to the full text.
         let settledEndU = (settled as NSString).length
@@ -349,6 +340,19 @@ final class SubtitleOverlay {
             playedU = settled.utf16.distance(from: settled.utf16.startIndex,
                                              to: idx.samePosition(in: settled.utf16)!)
         }
+
+        // Anchor the visible window on the line the VOICE is reading (playedU),
+        // not the newest settled line. Settled is append-only and grows at
+        // translation speed; when the voice lags behind it, anchoring on the
+        // newest line scrolled the spoken position off the top — the captions
+        // "vanishing ahead of the voice". Anchoring one line above the played
+        // line keeps the spoken position always visible (with the just-read
+        // line for context) and follows the voice down as it catches up; when
+        // the voice is current this is the newest line, same as before. Unread
+        // settled + grey flow below and clip at the box bottom.
+        let starts = karaokeLineStarts(settled, width: textWidth)
+        let playedLineIdx = starts.lastIndex(where: { $0 <= playedU }) ?? 0
+        let visibleStart = starts[max(0, playedLineIdx - 1)]
 
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .left
