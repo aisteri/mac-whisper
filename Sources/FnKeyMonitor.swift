@@ -49,16 +49,21 @@ final class FnKeyMonitor {
     private var longDown = false
 
     /// Fired on an option+shift double-tap — the meeting translation-overlay
-    /// toggle. Pure ⌥⇧ only (no Ctrl/Cmd), so it never fires as part of a
-    /// larger chord: two "both-held" rising edges within the window below.
+    /// toggle. Pure ⌥⇧ only (no Ctrl/Cmd). A "tap" is ⌥⇧ pressed AND released
+    /// quickly (≤ tapHoldMax); two such taps within the window fire it. Holding
+    /// ⌥⇧ during editing (⌥⇧+arrows for word-selection) is a long press, not a
+    /// tap, so it no longer misfires the toggle.
     var onTranslateOverlayToggle: (() -> Void)?
-    /// True while pure ⌥⇧ is held, so only the transition INTO that state
-    /// counts as a tap (a held ⌥⇧ during word-selection is one edge, not many).
+    /// True while pure ⌥⇧ is held; the transition into/out of it bounds a tap.
     private var optShiftHeld = false
-    /// Event timestamp (seconds since boot, monotonic) of the last ⌥⇧ tap.
+    /// Event timestamp of the rising edge into pure ⌥⇧, to measure hold length.
+    private var optShiftDownAt: TimeInterval = 0
+    /// Event timestamp of the last COMPLETED short tap.
     private var lastOptShiftTapAt: TimeInterval = 0
-    /// Two taps closer than this are a double-tap. Short enough that an
-    /// incidental ⌥⇧ press during editing rarely repeats inside it.
+    /// A tap must be released within this to count — longer is a deliberate
+    /// hold (editing), not a tap. This is what stops the editing misfires.
+    private let tapHoldMax: TimeInterval = 0.35
+    /// Two taps closer than this are a double-tap.
     private let overlayDoubleTapWindow: TimeInterval = 0.4
 
     /// Modifier flags we track for chords.
@@ -265,16 +270,27 @@ final class FnKeyMonitor {
     }
 
     /// Detects an option+shift double-tap for the meeting translation overlay.
-    /// Only the rising edge into pure ⌥⇧ (no Ctrl/Cmd) is a tap, so holding
-    /// ⌥⇧ (e.g. word-selection) is a single edge; two edges within
-    /// `overlayDoubleTapWindow` fire the toggle.
+    /// A tap is pure ⌥⇧ (no Ctrl/Cmd) pressed AND released within `tapHoldMax`;
+    /// two taps within `overlayDoubleTapWindow` fire the toggle. Requiring a
+    /// quick release is what distinguishes a deliberate double-tap from ⌥⇧ held
+    /// down during editing (⌥⇧+arrows), which used to misfire repeatedly.
     private func detectOverlayDoubleTap(_ event: NSEvent) {
         let mods = event.modifierFlags
         let pure = mods.contains(.option) && mods.contains(.shift)
             && !mods.contains(.control) && !mods.contains(.command)
-        defer { optShiftHeld = pure }
-        guard pure, !optShiftHeld else { return } // rising edge only
         let now = event.timestamp
+        defer { optShiftHeld = pure }
+        if pure, !optShiftHeld {
+            optShiftDownAt = now // rising edge — start timing the hold
+            return
+        }
+        guard !pure, optShiftHeld else { return } // otherwise: falling edge only
+        // A tap only counts if ⌥⇧ was released quickly; a long hold is editing.
+        guard optShiftDownAt > 0, now - optShiftDownAt <= tapHoldMax else {
+            optShiftDownAt = 0
+            return
+        }
+        optShiftDownAt = 0
         if lastOptShiftTapAt > 0, now - lastOptShiftTapAt <= overlayDoubleTapWindow {
             lastOptShiftTapAt = 0
             NSLog("MacTranscribe[Fn]: ⌥⇧ double-tap")

@@ -860,18 +860,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Toggles the meeting translation overlay. No-op (with feedback) when the
     /// current session can't host one.
     private func toggleTranslationOverlay() {
+        // Refusals are silent (diag only, no bubble): this is reachable by an
+        // accidental ⌥⇧ double-tap, and a warning for an action the user never
+        // meant to take is just noise on the menu bar.
         guard isLockedRecording, lockMode == .meeting else {
-            if isLockedRecording {
-                showTrayBubble("⚠︎ 통역은 회의록 모드에서만 됩니다")
-            }
+            SpeechService.diag("overlay toggle ignored: not in a meeting recording")
             return
         }
         guard overlayAvailable else {
             let why = settings.deeplVoiceEnabled
-                ? "DeepL Voice는 자체 언어 감지 — 오버레이 불필요"
-                : "출발 언어를 인식 가능한 언어로 지정하세요"
-            showTrayBubble("⚠︎ 통역 불가 — \(why)")
-            SpeechService.diag("overlay toggle refused: \(why)")
+                ? "DeepL Voice self-detects — overlay not needed"
+                : "source language not recognizable"
+            SpeechService.diag("overlay toggle ignored: \(why)")
             return
         }
         if translationOverlayActive { disableTranslationOverlay() }
