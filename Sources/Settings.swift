@@ -99,11 +99,6 @@ final class Settings {
         static let interpreterSource = "interpreterSourceLanguage"
         static let liveTranslation = "liveTranslationEnabled"
         static let audioSource = "lockedAudioSource"
-        static let googleClientID = "googleClientID"
-        static let googleClientSecret = "googleClientSecret"
-        static let calendarAutoRecord = "calendarAutoRecordEnabled"
-        static let calendarLeadMinutes = "calendarLeadMinutes"
-        static let calendarSelectedEvents = "calendarSelectedEventIDs"
     }
 
     /// Environment variable name holding the LLM API key. Set it via
@@ -369,37 +364,6 @@ final class Settings {
         let source = activeInterpreterSource
         guard !source.isEmpty, source != TranslationLanguage.autoSource else { return false }
         return RecognitionLanguage(sourceLanguage: source) == nil
-    }
-
-    // MARK: - Google Calendar auto-record
-
-    /// Google OAuth desktop-client credentials, entered by the user (this repo
-    /// is public, so they are not compiled in). Both empty until connected.
-    var googleClientID: String {
-        get { defaults.string(forKey: Keys.googleClientID) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.googleClientID) }
-    }
-    var googleClientSecret: String {
-        get { defaults.string(forKey: Keys.googleClientSecret) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.googleClientSecret) }
-    }
-
-    /// Master switch for starting recordings from calendar events.
-    var calendarAutoRecordEnabled: Bool {
-        get { defaults.bool(forKey: Keys.calendarAutoRecord) }
-        set { defaults.set(newValue, forKey: Keys.calendarAutoRecord) }
-    }
-
-    /// How many minutes before an event's start to begin recording.
-    var calendarLeadMinutes: Int {
-        get { defaults.object(forKey: Keys.calendarLeadMinutes) as? Int ?? 1 }
-        set { defaults.set(newValue, forKey: Keys.calendarLeadMinutes) }
-    }
-
-    /// Calendar event instance IDs the user chose to auto-record.
-    var calendarSelectedEventIDs: [String] {
-        get { defaults.stringArray(forKey: Keys.calendarSelectedEvents) ?? [] }
-        set { defaults.set(newValue, forKey: Keys.calendarSelectedEvents) }
     }
 
     /// Generate structured meeting notes with the LLM after a locked

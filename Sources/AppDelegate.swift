@@ -81,9 +81,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// from the menu, ended with a single Fn tap. The transcript is written to a
     /// file instead of pasted, so long captures never touch the clipboard.
     private var isLockedRecording = false
-    /// Read-only view for the calendar scheduler's fire guard.
-    var isLockedRecordingPublic: Bool { isLockedRecording }
-    private let calendarScheduler = CalendarScheduler()
     /// When the current locked session started (guards instant re-toggle).
     private var lockStartedAt = Date.distantPast
     /// True between the stop gesture and the session's final delivery, so
@@ -117,7 +114,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         requestPermissionsAndStart()
         wireSpeech()
         UNUserNotificationCenter.current().delegate = self
-        refreshCalendarScheduler()
     }
 
     // MARK: - Notes-done notifications
@@ -371,9 +367,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 if self.settings.subtitleOverlayEnabled { self.subtitles.show() }
                 else { self.subtitles.hide() }
             }
-            // Connect/disconnect, enable, or event-selection changes restart the
-            // calendar poller.
-            self.refreshCalendarScheduler()
             self.rebuildMenu()
         }
 
@@ -612,10 +605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     // MARK: - Locked (hands-free) recording
 
-    /// `forceMeeting` guarantees a meeting-mode (minutes) recording regardless
-    /// of the Live Translation setting — used by the calendar scheduler, whose
-    /// automatic recordings should always be plain meeting captures.
-    private func startLockedRecording(forceMeeting: Bool = false) {
+    private func startLockedRecording() {
         guard !isLockedRecording else { return }
         // The Live Translation toggle is the master switch; the Engine tab's
         // Translation provider decides who does the work and what "ready"
@@ -625,7 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             || (settings.deeplEnabled && settings.deeplConfigured)
             || (!settings.deeplEnabled && settings.llmConfigured)
         let translationReady = settings.liveTranslationEnabled && providerReady
-        let mode: LockMode = (translationReady && !forceMeeting) ? .interpreter : .meeting
+        let mode: LockMode = translationReady ? .interpreter : .meeting
         // A pinned source the local recognizer can't hear (DeepL offers
         // German, French, … with no matching recognizer) would mistranscribe
         // every word before translation even sees it. DeepL Voice does its
@@ -979,24 +969,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 ? "[\(srcTag)] \(p.source)"
                 : "[\(srcTag)] \(p.source)\n[\(tgtTag)] \(p.translation)"
         }.joined(separator: "\n")
-    }
-
-    /// Fired by the calendar scheduler when a selected meeting is due. Starts a
-    /// meeting-mode recording (never interpretation); the scheduler's own guard
-    /// plus `startLockedRecording`'s `guard !isLockedRecording` make it safe if
-    /// something is already recording.
-    private func startScheduledMeeting(_ event: GoogleCalendar.CalendarEvent) {
-        guard !isLockedRecording else { return }
-        SpeechService.diag("scheduled meeting start '\(event.title)'")
-        startLockedRecording(forceMeeting: true)
-        showTrayBubble("📅 \(event.title) — 자동 녹음 시작")
-    }
-
-    /// (Re)starts the calendar scheduler from current settings. Called at launch
-    /// and whenever settings change (connect/disconnect, enable, selection).
-    func refreshCalendarScheduler() {
-        calendarScheduler.onFire = { [weak self] event in self?.startScheduledMeeting(event) }
-        calendarScheduler.start()
     }
 
     private func stopLockedRecording() {

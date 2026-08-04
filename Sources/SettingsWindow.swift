@@ -60,13 +60,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var apiKeyLabel: NSTextField!
     private let apiKeyStatusLabel = NSTextField(labelWithString: "")
     private let chatgptAuthButton = NSButton()
-    // General — Google Calendar auto-record
-    private let googleClientIDField = NSTextField()
-    private let googleClientSecretField = NSTextField()
-    private let calendarEnableCheck = NSButton(checkboxWithTitle: "선택한 회의 시간에 자동으로 녹음 시작", target: nil, action: nil)
-    private let googleConnectButton = NSButton()
-    private let googleStatusLabel = NSTextField(labelWithString: "")
-    private let pickMeetingsButton = NSButton()
     // Engine — Translation category
     private let transProviderPopup = NSPopUpButton()
     private var transModelLabel: NSTextField!
@@ -93,7 +86,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 500),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -149,7 +142,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         place(v, x: x, top: top, w: w, h: height, in: view)
     }
     /// Usable height inside a tab (window minus the tab strip/chrome).
-    private let tabHeight: CGFloat = 640
+    private let tabHeight: CGFloat = 460
     private let fieldX: CGFloat = 150
     private let fieldW: CGFloat = 300
 
@@ -203,50 +196,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let autoStopNote = NSTextField(labelWithString: "Ends a session automatically after a long silence.")
         autoStopNote.font = .systemFont(ofSize: 11); autoStopNote.textColor = .secondaryLabelColor
         place(autoStopNote, x: 40, top: 278, w: 420, h: 16, in: view)
-
-        buildCalendarSection(view)
-    }
-
-    /// Google Calendar auto-record — a separate section at the bottom of the
-    /// General (recording) tab. Optional: dormant until credentials are entered
-    /// and the account is connected.
-    private func buildCalendarSection(_ view: NSView) {
-        sectionLabel("Google Calendar 자동 녹음", top: 322, in: view)
-        let intro = NSTextField(labelWithString: "선택한 회의 시작 1분 전에 자동으로 회의록 녹음을 시작합니다. (정지는 수동)")
-        intro.font = .systemFont(ofSize: 11); intro.textColor = .secondaryLabelColor
-        place(intro, x: 20, top: 344, w: 440, h: 16, in: view)
-
-        _ = label("Client ID:", top: 368, in: view)
-        googleClientIDField.isEditable = true; googleClientIDField.isBezeled = true
-        googleClientIDField.bezelStyle = .roundedBezel
-        googleClientIDField.placeholderString = "xxxx.apps.googleusercontent.com"
-        googleClientIDField.delegate = self
-        place(googleClientIDField, x: fieldX, top: 366, w: fieldW, in: view)
-
-        _ = label("Client secret:", top: 398, in: view)
-        googleClientSecretField.isEditable = true; googleClientSecretField.isBezeled = true
-        googleClientSecretField.bezelStyle = .roundedBezel
-        googleClientSecretField.placeholderString = "GOCSPX-…"
-        googleClientSecretField.delegate = self
-        place(googleClientSecretField, x: fieldX, top: 396, w: fieldW, in: view)
-
-        googleConnectButton.bezelStyle = .rounded
-        googleConnectButton.target = self
-        googleConnectButton.action = #selector(googleConnectTapped)
-        place(googleConnectButton, x: fieldX, top: 428, w: 140, h: 28, in: view)
-        googleStatusLabel.font = .systemFont(ofSize: 11)
-        googleStatusLabel.textColor = .secondaryLabelColor
-        place(googleStatusLabel, x: fieldX + 150, top: 431, w: fieldW - 150, h: 22, in: view)
-
-        calendarEnableCheck.target = self
-        calendarEnableCheck.action = #selector(calendarEnableChanged)
-        place(calendarEnableCheck, x: 20, top: 466, w: 440, h: 20, in: view)
-
-        pickMeetingsButton.title = "자동 녹음할 회의 선택…"
-        pickMeetingsButton.bezelStyle = .rounded
-        pickMeetingsButton.target = self
-        pickMeetingsButton.action = #selector(pickMeetingsTapped)
-        place(pickMeetingsButton, x: fieldX, top: 494, w: 220, h: 28, in: view)
     }
 
     // MARK: - Translation tab
@@ -467,9 +416,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         selectByRepresented(recognitionPopup, s.language.rawValue)
         refreshTriggerKeys()
         autoStopCheck.state = s.silenceAutoStopEnabled ? .on : .off
-        googleClientIDField.stringValue = s.googleClientID
-        googleClientSecretField.stringValue = s.googleClientSecret
-        refreshGoogleStatus()
 
         liveTranslationCheck.state = s.liveTranslationEnabled ? .on : .off
         transMicRadio.state = s.translationAudioSourceIsSystem ? .off : .on
@@ -716,18 +662,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        let field = notification.object as? NSTextField
-        if field === googleClientIDField {
-            Settings.shared.googleClientID = googleClientIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            refreshGoogleStatus()
-            return
-        }
-        if field === googleClientSecretField {
-            Settings.shared.googleClientSecret = googleClientSecretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            refreshGoogleStatus()
-            return
-        }
-        guard field === deeplKeyField, !deeplKeyMasked else { return }
+        guard (notification.object as? NSTextField) === deeplKeyField, !deeplKeyMasked else { return }
         // Persist on blur, but keep the text visible — masking waits for a
         // successful Test so the user can see what they typed until then.
         Settings.shared.deeplAPIKey = deeplKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1001,60 +936,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
                     self.statusLabel.stringValue = "Sign-in failed: \(error.localizedDescription)"
                 }
             }
-        }
-    }
-
-    // MARK: - Google Calendar handlers
-
-    /// Reflects connection state on the button + status label (mirrors
-    /// refreshAPIKeyStatus). Enables the meeting-picker only when connected.
-    private func refreshGoogleStatus() {
-        let signedIn = GoogleOAuth.shared.isSignedIn
-        googleConnectButton.title = signedIn ? "연동 해제" : "연동"
-        if signedIn {
-            googleStatusLabel.textColor = .systemGreen
-            googleStatusLabel.stringValue = "✓ 연동됨: \(GoogleOAuth.shared.signedInEmail ?? "")"
-        } else {
-            googleStatusLabel.textColor = .secondaryLabelColor
-            googleStatusLabel.stringValue = Settings.shared.googleClientID.isEmpty
-                ? "Client ID/secret 입력 후 연동하세요"
-                : "연동되지 않음"
-        }
-        pickMeetingsButton.isEnabled = signedIn
-        calendarEnableCheck.state = Settings.shared.calendarAutoRecordEnabled ? .on : .off
-    }
-
-    @objc private func googleConnectTapped() {
-        if GoogleOAuth.shared.isSignedIn {
-            GoogleOAuth.shared.signOut()
-            refreshGoogleStatus()
-            onSettingsChanged?()
-            return
-        }
-        googleStatusLabel.textColor = .secondaryLabelColor
-        googleStatusLabel.stringValue = "브라우저에서 로그인을 완료하세요…"
-        GoogleOAuth.shared.signIn { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.refreshGoogleStatus()
-                if case .failure(let error) = result {
-                    self.googleStatusLabel.textColor = .systemRed
-                    self.googleStatusLabel.stringValue = "연동 실패: \(error.localizedDescription)"
-                }
-                self.onSettingsChanged?()
-            }
-        }
-    }
-
-    @objc private func calendarEnableChanged() {
-        Settings.shared.calendarAutoRecordEnabled = (calendarEnableCheck.state == .on)
-        onSettingsChanged?()
-    }
-
-    @objc private func pickMeetingsTapped() {
-        guard let window else { return }
-        CalendarPickerSheet.present(over: window) { [weak self] in
-            self?.onSettingsChanged?()
         }
     }
 
