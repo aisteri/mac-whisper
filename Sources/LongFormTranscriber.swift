@@ -64,6 +64,17 @@ final class LongFormTranscriber {
 
     private var finalizedText = ""
     private var volatileText = ""
+    /// Local-agreement committed prefix of the CURRENT segment (the span since
+    /// the last final). It advances only to text that has stayed identical
+    /// across consecutive volatile hypotheses, minus the still-forming last
+    /// word — so it is safe to treat as stable WITHOUT forcing a finalize that
+    /// would truncate the word being spoken. This is what makes the stable
+    /// region grow continuously for the interpreter. Reset to "" on every
+    /// final. Guarded by stateLock.
+    private var segCommitted = ""
+    /// The previous volatile hypothesis (as characters), for the consecutive-
+    /// hypothesis common-prefix comparison. Guarded by stateLock.
+    private var prevHypothesis: [Character] = []
     private var isRunning = false
     private var didFinish = false
     private let stateLock = NSLock()
@@ -90,8 +101,9 @@ final class LongFormTranscriber {
     /// the time, so `sentenceDoneSilenceGap` almost never applies and this gap
     /// governs the stream). Reading each fragment as its own utterance is the
     /// "chopped, staccato" delivery. 1.0 s keeps a speaker who merely paused to
-    /// breathe on one continuous turn; `cadenceFinalizeAfter` (2.5 s) still
-    /// caps how long an unbroken speaker can starve finalization.
+    /// breathe on one continuous turn; an unbroken speaker no longer starves
+    /// the interpreter, because local agreement commits the stable prefix of
+    /// the volatile stream continuously without waiting for a finalize.
     private let utteranceSilenceGap: TimeInterval = 1.0
     /// When the hypothesis already ends in sentence-final punctuation the
     /// sentence is really over — seal faster for interpreter responsiveness.
@@ -101,22 +113,6 @@ final class LongFormTranscriber {
     /// last ~0.3 s of audio became text, which is how utterance endings got
     /// lost. Wait for the hypothesis ink to dry.
     private let volatileInkDry: TimeInterval = 0.3
-    /// Audio-thread timestamp of the last finalize request (pacing).
-    private var lastFinalizeAt = Date.distantPast
-    /// Finalization is only ever requested when the recognizer has stopped
-    /// revising: after a real silence (VAD), or when the volatile hypothesis
-    /// has been stable this long. Forcing a finalize MID-utterance (the old
-    /// fixed timer) made the recognizer commit a half-formed hypothesis —
-    /// low-confidence words were dropped or collapsed to "." and sentences
-    /// were cut at arbitrary points, splitting words across translations.
-    private let volatileStableFinalizeAfter: TimeInterval = 2.0
-    private let minFinalizeSpacing: TimeInterval = 1.5
-    /// Past this without a finalize, any ink-dry lull commits (see the
-    /// cadence note in trackVoiceActivity) — continuous speech must not
-    /// starve finalization. 2.5 s ≈ a human interpreter's ear-voice span;
-    /// earlier commits trade a little recognition-revision headroom for
-    /// pace, which is this app's stated priority.
-    private let cadenceFinalizeAfter: TimeInterval = 2.5
 
     private func trackVoiceActivity(_ level: Float) {
         // ~20 ms per buffer; 0.995^n halves the envelope in roughly 3 s.
@@ -135,11 +131,22 @@ final class LongFormTranscriber {
             voiceActive = true
             lastVoiceAt = now
         } else if voiceActive {
-            // A real speech pause ends the utterance — but only once the
-            // recognizer has caught up (ink dry) and the pause is long enough.
-            // A hypothesis already ending in sentence-final punctuation seals
-            // on the shorter gap; an unfinished one gets the full pause so
-            // mid-sentence breathing doesn't shatter sentences into fragments.
+            // A real speech pause ends the utterance. This silence-seal is now
+            // the ONLY finalize trigger: it fires only once the recognizer has
+            // caught up (ink dry) and the speaker has genuinely paused, so the
+            // hypothesis is complete and the finalize can't cut a word. It also
+            // flushes the last word of the utterance, which local agreement
+            // deliberately holds back (there is no "next word" to confirm it).
+            // A hypothesis already ending in sentence-final punctuation seals on
+            // the shorter gap; an unfinished one gets the full pause so mid-
+            // sentence breathing doesn't shatter sentences into fragments.
+            //
+            // The old mid-speech cadence/stale finalize is gone: forcing a
+            // finalize while the speaker was still talking made the recognizer
+            // commit a half-formed hypothesis and truncated the word being
+            // spoken (dropped chars/words). Interpreter latency no longer needs
+            // it — local-agreement commits over the volatile stream (see fold)
+            // advance the stable region continuously without any finalize.
             stateLock.lock()
             let trailing = volatileText.last(where: { !$0.isWhitespace })
             let inkDry = now.timeIntervalSince(volatileChangedAt) >= volatileInkDry
@@ -149,37 +156,8 @@ final class LongFormTranscriber {
             if now.timeIntervalSince(lastVoiceAt) >= gap, inkDry {
                 voiceActive = false
                 SpeechService.diag("longform silence \(String(format: "%.2f", now.timeIntervalSince(lastVoiceAt)))s -> finalize+seal (sentenceDone=\(sentenceDone) envelope=\(levelEnvelope))")
-                lastFinalizeAt = now
                 requestFinalize(sealTurnAfter: true)
-                return
             }
-        }
-        // Stale-hypothesis finalize: the recognizer hasn't revised its
-        // volatile text for a while, so committing it loses nothing — this
-        // covers sources whose background music defeats the level VAD.
-        //
-        // CADENCE: silence and a 2 s-stale hypothesis were the ONLY
-        // finalize triggers, and a speaker who never pauses (any meeting)
-        // hits neither — finalization froze for 20-30 s and then a whole
-        // paragraph settled at once ("stuck, then whooshes past"; the same
-        // mechanism made a ~26 s cold start). Past `cadenceFinalizeAfter`
-        // without a finalize, committing during ANY brief lull (ink-dry,
-        // 0.3 s) beats waiting for a full stability window — same nature
-        // as the stale trigger, just impatient.
-        guard now.timeIntervalSince(lastFinalizeAt) >= minFinalizeSpacing else { return }
-        let sinceFinalize = now.timeIntervalSince(lastFinalizeAt)
-        let requiredLull = sinceFinalize >= cadenceFinalizeAfter
-            ? volatileInkDry : volatileStableFinalizeAfter
-        stateLock.lock()
-        let lull = now.timeIntervalSince(volatileChangedAt)
-        let volatileStable = !volatileText.isEmpty && lull >= requiredLull
-        stateLock.unlock()
-        if volatileStable {
-            if requiredLull == volatileInkDry {
-                SpeechService.diag(String(format: "longform cadence finalize +%.1fs since last", sinceFinalize))
-            }
-            lastFinalizeAt = now
-            requestFinalize()
         }
     }
 
@@ -251,11 +229,17 @@ final class LongFormTranscriber {
         return finalizedText + volatileText
     }
 
-    /// Character count of the finalized (stable) prefix of combinedTranscript.
+    /// Character count of the STABLE prefix of combinedTranscript — the part
+    /// the recognizer will not rewrite. That is the finalized text plus the
+    /// local-agreement committed prefix of the open segment. `segCommitted`
+    /// only grows, so a hypothesis that briefly shrinks could leave it longer
+    /// than the current volatile tail; clamp to the visible text so the value
+    /// is always a real index into combinedTranscript.
     private var stableLength: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return finalizedText.count
+        if volatileText.isEmpty { return finalizedText.count }
+        return finalizedText.count + min(segCommitted.count, volatileText.count)
     }
 
     /// Session generation. Bumped on every start() so a stale async pipeline —
@@ -442,6 +426,11 @@ final class LongFormTranscriber {
         analyzer = nil
         resultsTask?.cancel()
         resultsTask = nil
+        // The new analyzer restarts the volatile stream from scratch — the
+        // held-back local-agreement state would otherwise falsely agree with
+        // the old segment's last hypothesis.
+        segCommitted = ""
+        prevHypothesis = []
         let language = sessionLanguage
         stateLock.unlock()
         oldBuilder?.finish()
@@ -480,6 +469,8 @@ final class LongFormTranscriber {
         let myGen = gen
         finalizedText = ""
         volatileText = ""
+        segCommitted = ""
+        prevHypothesis = []
         sessionLanguage = newLanguage
         pipelineRestartInFlight = true // hold the mute watchdog off during the swap
         let oldBuilder = inputBuilder
@@ -521,6 +512,8 @@ final class LongFormTranscriber {
         stateLock.lock()
         finalizedText = ""
         volatileText = ""
+        segCommitted = ""
+        prevHypothesis = []
         sessionPeakLevel = 0
         sessionLanguage = language
         audioStartedAt = .distantFuture
@@ -748,7 +741,8 @@ final class LongFormTranscriber {
     /// precedes the word), while a long punctuation/whitespace run trails one
     /// (the pause follows the mark) — so the break lands before or after
     /// accordingly. A long leading run also marks the boundary against the
-    /// PREVIOUS final, which matters now that finalization runs every ~2.5 s.
+    /// PREVIOUS final, which matters when the recognizer emits several finals
+    /// across one continuous stretch of speech.
     /// Furthest audio time (seconds) already committed to finalizedText;
     /// touched only from the results task.
     private var lastFinalizedAudioEnd: Double = 0
@@ -806,12 +800,55 @@ final class LongFormTranscriber {
                 sealOverlongOpenTurnLocked()
             }
             volatileText = ""
+            // The final is authoritative and whole; the open segment is closed,
+            // so its local-agreement state resets for the next one.
+            segCommitted = ""
+            prevHypothesis = []
         } else if text != volatileText {
             volatileText = text
             volatileChangedAt = Date()
+            // Local agreement over the volatile stream: the interpreter needs a
+            // stable prefix that grows FAST, but forcing the recognizer to
+            // finalize to get one truncated the word being spoken. Instead,
+            // commit the prefix that has stayed identical across this and the
+            // previous hypothesis, minus the still-forming last word. It never
+            // cuts a word (that word is held back until the next one confirms
+            // it, or the silence-seal finalizes the whole utterance) and it
+            // advances every time the front of the hypothesis settles — which
+            // is continuously, without any finalize.
+            let cur = Array(text)
+            let agreed = Self.commonPrefixCount(prevHypothesis, cur)
+            let commit = Self.stableCommitCount(cur, agreedUpTo: agreed)
+            if commit > segCommitted.count {
+                segCommitted = String(cur[0..<commit])
+            }
+            prevHypothesis = cur
         }
         stateLock.unlock()
         return combinedTranscript
+    }
+
+    /// Length of the shared leading run of two character arrays.
+    private static func commonPrefixCount(_ a: [Character], _ b: [Character]) -> Int {
+        let n = min(a.count, b.count)
+        var i = 0
+        while i < n, a[i] == b[i] { i += 1 }
+        return i
+    }
+
+    /// Given a hypothesis and how many of its leading characters are agreed
+    /// across the last two revisions, returns how many to actually COMMIT —
+    /// holding back the final, still-forming word so a word is never cut mid-
+    /// utterance. For spaced scripts (Korean, English) that means cutting at
+    /// the last whitespace inside the agreed span. For spaceless CJK (no
+    /// whitespace to cut on), hold back a 2-character margin, since the most-
+    /// recently-recognized syllable is the one the recognizer still revises.
+    private static func stableCommitCount(_ chars: [Character], agreedUpTo k: Int) -> Int {
+        guard k > 0 else { return 0 }
+        var i = k
+        while i > 0, !chars[i - 1].isWhitespace { i -= 1 }
+        if i > 0 { return i }
+        return max(0, k - 2)
     }
 
     private func startEngine() throws {

@@ -1,6 +1,6 @@
 {
   "name": "mac-transcribe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hold Fn to talk. A macOS menu-bar app that turns your voice into text, anywhere your cursor is — with optional LLM refinement.",
   "license": "MIT",
   "private": true,
