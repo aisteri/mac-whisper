@@ -308,6 +308,9 @@ final class LongFormTranscriber {
     private let captureStallTimeout: TimeInterval = 5
     private var captureStallBackoff: TimeInterval = 5
     private var lastCaptureRestartAt = Date.distantPast
+    /// Guards mic-engine restarts (config-change notification + watchdog).
+    private var micRestartInFlight = false
+    private var configChangeObserver: NSObjectProtocol?
 
     private func startCaptureWatchdog() {
         captureWatchdogTimer?.invalidate()
@@ -330,10 +333,13 @@ final class LongFormTranscriber {
               Date().timeIntervalSince(max(last, lastCaptureRestartAt)) > captureStallBackoff
         else { return }
         guard audioSource == .systemAudio else {
-            // A dead mic engine has not been observed; log so it becomes
-            // diagnosable if it ever is.
-            SpeechService.diag("capture watchdog: mic buffers stalled (no auto-restart)")
-            stateLock.lock(); lastBufferAt = Date(); stateLock.unlock()
+            // Backstop for the mic engine dying without a config-change
+            // notification (some sleep/wake paths kill it silently). The tap
+            // delivers buffers even through silence, so a multi-second gap
+            // means the engine is dead — rebuild it (backup handle preserved).
+            SpeechService.diag("capture watchdog: mic buffers stalled — restarting mic engine")
+            lastCaptureRestartAt = Date()
+            restartMicEngine(reason: "watchdog stall")
             return
         }
         if last <= lastCaptureRestartAt {
@@ -851,7 +857,11 @@ final class LongFormTranscriber {
         return max(0, k - 2)
     }
 
-    private func startEngine() throws {
+    /// Opens the mic engine and installs the tap. On the initial start it also
+    /// opens the audio backup file; a restart passes `reopenBackup: false` so
+    /// the existing AVAudioFile handle keeps appending — reopening it would
+    /// TRUNCATE the session's recording to whatever arrived after the restart.
+    private func startEngine(reopenBackup: Bool = true) throws {
         let engine = AVAudioEngine()
         audioEngine = engine
         let inputNode = engine.inputNode
@@ -867,7 +877,7 @@ final class LongFormTranscriber {
         }
         SpeechService.diag("longform input \(format.sampleRate)Hz ch=\(format.channelCount) engineDevice=\(boundDevice) analyzerFormat=\(analyzerFormat.map { "\($0.sampleRate)Hz ch=\($0.channelCount)" } ?? "nil")")
 
-        if let url = audioBackupURL {
+        if reopenBackup, let url = audioBackupURL {
             let settings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: format.sampleRate,
@@ -901,6 +911,62 @@ final class LongFormTranscriber {
         }
         engine.prepare()
         try engine.start()
+        installConfigChangeObserver(for: engine)
+    }
+
+    /// AVAudioEngine posts this and STOPS ITSELF when the input hardware
+    /// configuration changes mid-session — a Bluetooth/USB mic connecting or
+    /// disconnecting, a sample-rate change, sleep/wake in clamshell. Without a
+    /// handler the engine stays dead, so mic buffers, the audio backup, and the
+    /// transcript all silently stop (the "1-hour meeting saved only 10 minutes"
+    /// bug). Rebuild the engine in place; the backup file and analyzer survive.
+    private func installConfigChangeObserver(for engine: AVAudioEngine) {
+        // Scope to THIS engine instance so other AVAudioEngines in the app
+        // (e.g. TTS playback) can't trigger a mic restart. Re-registered on
+        // every (re)start since each brings a fresh engine object.
+        removeConfigChangeObserver()
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            self?.restartMicEngine(reason: "config change")
+        }
+    }
+
+    private func removeConfigChangeObserver() {
+        if let obs = configChangeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configChangeObserver = nil
+        }
+    }
+
+    /// Tears down the mic engine and brings it back WITHOUT reopening the
+    /// backup file, so the recording stays continuous across the restart. Runs
+    /// on main (the config-change notification and the capture watchdog both
+    /// dispatch here). A restart-in-flight guard absorbs the burst of
+    /// notifications a single device change often emits. Must be called on the
+    /// main thread (both callers already are); AVAudioEngine requires it.
+    private func restartMicEngine(reason: String) {
+        guard audioSource == .microphone, isRunning else { return }
+        stateLock.lock()
+        let busy = micRestartInFlight
+        if !busy { micRestartInFlight = true }
+        stateLock.unlock()
+        guard !busy else { return }
+        SpeechService.diag("mic engine restart (\(reason))")
+        if let engine = audioEngine {
+            if engine.isRunning { engine.inputNode.removeTap(onBus: 0); engine.stop() }
+            engine.reset()
+        }
+        audioEngine = nil
+        do {
+            try startEngine(reopenBackup: false)
+            stateLock.lock(); lastBufferAt = Date(); stateLock.unlock()
+            SpeechService.diag("mic engine restart OK")
+        } catch {
+            SpeechService.diag("mic engine restart FAILED: \(error)")
+            onStatus?("Audio input lost — trying to recover…")
+        }
+        stateLock.lock(); micRestartInFlight = false; stateLock.unlock()
     }
 
     private var tapBufferCount = 0
@@ -1090,6 +1156,7 @@ final class LongFormTranscriber {
     }
 
     private func stopEngine() {
+        removeConfigChangeObserver()
         if let engine = audioEngine {
             if engine.isRunning {
                 engine.inputNode.removeTap(onBus: 0)

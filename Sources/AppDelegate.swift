@@ -210,6 +210,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func rebuildMenu() {
         let menu = NSMenu()
 
+        // App identity + version at the very top; clicking opens the standard
+        // About panel (program info) sourced from Info.plist.
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let about = NSMenuItem(title: "Mac Transcribe v\(version)", action: #selector(showAboutPanel), keyEquivalent: "")
+        about.target = self
+        about.image = menuIcon("info.circle")
+        menu.addItem(about)
+        menu.addItem(.separator())
+
         let header = NSMenuItem(title: "Hold Fn to talk", action: nil, keyEquivalent: "")
         header.isEnabled = false
         header.attributedTitle = holdToTalkTitle()
@@ -1627,6 +1636,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc private func openPermissions() {
         permissionsController.showWindow()
+    }
+
+    @objc private func showAboutPanel() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     @objc private func quitApp() {
