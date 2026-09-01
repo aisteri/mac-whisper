@@ -1405,7 +1405,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// (glossary included in the prompt) and saves them as notes-<stamp>.md.
     /// Failures only log — the transcript file is already safe on disk.
     private func generateMeetingNotes(from transcript: String, stamp: String) {
-        let attendees = askAttendees()
+        // Attendee prompt retired: notes generate immediately with no roster.
+        // `askAttendees()` is kept below, unused, so it can be reinstated later.
+        let attendees = ""
         beginPostRecordingTask()
         NSLog("MacTranscribe[App]: generating meeting notes chars=\(transcript.count)")
         SpeechService.diag("meeting notes generating chars=\(transcript.count) attendees=\(attendees.isEmpty ? "none" : "\(attendees.split(whereSeparator: { ",\n".contains($0) }).count)")")
