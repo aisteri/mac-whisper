@@ -38,10 +38,12 @@ struct LLMProvider {
         LLMProvider(
             id: "chatgpt", displayName: "ChatGPT (Plus/Pro Subscription)",
             baseURL: "https://chatgpt.com/backend-api", proto: .chatgpt,
-            // Must match the backend's model catalog (GET /codex/models); older
-            // gpt-5.1/5.2 slugs are rejected with HTTP 400 as of mid-2026.
-            models: ["gpt-5.4-mini", "gpt-5.5", "gpt-5.4"],
-            defaultModel: "gpt-5.4-mini",
+            // Must match the backend's model catalog (GET /codex/models); slugs
+            // not in the catalog are rejected with HTTP 400. The catalog rotates
+            // over time — gpt-5.4/5.4-mini were dropped by 2026-09 (verified
+            // against /codex/models); keep this list to currently-served slugs.
+            models: ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"],
+            defaultModel: "gpt-5.5",
             reasoningEfforts: ["low", "medium", "high"]
         ),
         LLMProvider(

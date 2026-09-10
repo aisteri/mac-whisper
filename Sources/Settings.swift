@@ -213,7 +213,20 @@ final class Settings {
     var llmAPIKeyIsSet: Bool { !llmAPIKey.isEmpty }
 
     var llmModel: String {
-        get { defaults.string(forKey: Keys.llmModel) ?? "gpt-5.4-mini" }
+        get {
+            let saved = defaults.string(forKey: Keys.llmModel) ?? "gpt-5.4-mini"
+            // A provider's backend catalog rotates over time (ChatGPT dropped
+            // gpt-5.4-mini → HTTP 400 on every request). If the saved slug is
+            // no longer offered by the selected built-in provider, fall back to
+            // its current default so meeting notes / refinement keep working
+            // without the user having to reopen Settings. Custom providers keep
+            // whatever the user typed.
+            let p = llmProvider
+            if !p.isCustom, !p.models.isEmpty, !p.models.contains(saved) {
+                return p.defaultModel
+            }
+            return saved
+        }
         set { defaults.set(newValue, forKey: Keys.llmModel) }
     }
 
